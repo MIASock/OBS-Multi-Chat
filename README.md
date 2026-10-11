@@ -4,7 +4,9 @@ A local OBS companion that combines Twitch, Kick, and YouTube live chat into one
 
 ![Relay Chat Dock combining Twitch, Kick, and YouTube](docs/screenshot.png)
 
-![Activity dock with follows, donations, and platform icons](docs/activity.png)
+![OBS with Relay Chat and Relay Activity docks](docs/obs.png)
+
+![Activity dock with follows, donations, and platform icons. Right-click a pill to delete it.](docs/activity.png)
 
 ![Stream Controls with unified Twitch, Kick, and YouTube title and tags](docs/stream-controls.png)
 
@@ -41,12 +43,12 @@ GitHub Actions attaches both the zip and the setup exe when `main` first ships a
 - Chat history persistence in `data/chat.json` (the most recent `RELAY_CHAT_MAX` messages, 5000 by default). The file is rewritten about once a second and again on exit, so a crash can drop the last second of chat, and a backend restart does not empty the dock
 - Activity history persistence in `data/activity.json` (the most recent `RELAY_ACTIVITY_MAX` events, 5000 by default)
 - Twitch live detection, viewer count, EventSub/IRC chat, message sending, and title/category updates
-- YouTube live detection, viewer count, live-chat reading, and Live vs Shorts tags when the Shorts title includes `#shortsfeed`
+- YouTube live detection, concurrent viewer count (not the video's lifetime views), live-chat reading, and Live vs Shorts tags when the Shorts title includes `#shortsfeed`
 - Kick chat over Kick's public chat WebSocket
 - SSE updates from the backend to OBS
 - Unified Twitch + Kick stream title/category/tag controls, with arrow-key category picking and an Open YouTube Studio link
 
-- Activity dock (StreamElements as source of truth, optional native backup)
+- Activity dock (StreamElements as source of truth, optional native backup). YouTube subscribers are new in 0.9.3. Earlier builds did not show them: StreamElements sends those as subscriber events, and the dock used to store them as members, so a new YouTube subscriber never appeared as its own alert. They now show as **SUBSCRIBER**. YouTube members stay **MEMBER**.
 - Windows app window for the log, account connections, translate, and StreamElements JWTs. Closing that window stops the docks
 - Companion crash log in `logs/relay.log` (rotated to `relay.log.bak`), same folder as `production.env`. Watch tokens, JWTs, and OAuth secrets are redacted
 
@@ -69,7 +71,7 @@ http://localhost:4173
 http://localhost:4173/activity
 ```
 
-Add both as **Docks → Custom Browser Docks**, or let the installer register them and then check **Relay Chat** and **Relay Activity** under **Docks**. Chat is for messages and sending. Activity is the alert feed.
+Add both as **Docks → Custom Browser Docks**, or let the installer register them and then check **Relay Chat** and **Relay Activity** under **Docks**. Chat is for messages and sending. Deleting a line you sent from the dock uses the platform message id from that send (or from the echo), so the message is removed in channel chat and not only struck through in the dock. Saying the same thing twice within a few seconds stays as two lines. Activity is the alert feed.
 
 Stream Controls (gamepad on the chat dock) sets one title, one category search, and one tag list for Twitch + Kick. Category search queries both platforms and merges matching names; platform-only hits show a Twitch or Kick icon. **Twitch / Kick separately** expands to two category fields when the games differ. Tags share one chip field (max 10). Toggle Twitch / Kick next to the field before adding a chip. Dots on each chip show who gets it. **Open YouTube Studio** (next to the Twitch + Kick badge) opens the livestreaming dashboard for scheduling. Click a platform tile to open that platform's live dashboard (Twitch Stream Manager, Kick stream dashboard, or YouTube Studio). Hover a tile to see that platform's stream title. If YouTube has more than one live broadcast, the hover lists each title. The stream title always opens the YouTube Studio livestreaming dashboard, which lists every live screen. Click a chat username to open that person's Twitch viewer card for your channel, Kick profile, or YouTube channel page in the system browser. The viewer card needs your connected Twitch login in the path (`/popout/<you>/viewercard/<them>`). YouTube's community tab is often disabled, so that click opens the channel instead.
 
@@ -117,11 +119,11 @@ YouTube Data API v3 defaults to **10,000 units per day** (reset at midnight Paci
 
 The companion window links to the [Cloud Console quotas page](https://console.cloud.google.com/iam-admin/quotas?service=youtube.googleapis.com). To enter your current usage, open the **YouTube Data API v3** group and read the **Queries per day** row: **Current usage** (for example `35`) and **Value** (the daily limit, usually `10,000`). Ignore the **All quotas & system limits** card near the top of the page (for example `1,247`) — that is a count of how many quota rows exist, not units you have used. Type `35` or `35/10000` in the window; logging does not block on your input. After that, the app estimates forward from its own official API calls and warns near 80% and when the daily cap is reached. InnerTube site chat does not count against the quota.
 
-Live chat and viewer counts use YouTube’s public site/InnerTube reader, not a polling loop on `liveChatMessages.list`. The official API is used sparingly: live-broadcast detection about every 15 seconds until the broadcast is live (same cadence as Twitch and Kick; `liveBroadcasts.list` is 1 unit), then about every 5 minutes while live so ending the stream is noticed without a status call four times a minute. A one-shot history seed runs when a new live chat appears, plus sending and deleting messages, and a slow official chat fallback only if InnerTube fails. Leaving Auto on while YouTube is offline all day is about 5,800 units, so uncheck it if the app stays open and you are not about to go live. **Check live** in connection settings runs that official status check immediately without changing the automatic interval. The **Auto** box beside it is on by default for Twitch, Kick, and YouTube. Uncheck it to skip that platform’s automatic live-status polls. Chat that is already connected keeps updating. Going live or offline, and viewer counts from those polls, stay as last seen until you press **Check live**. For YouTube, Auto off skips the official live-broadcast status call (the quota one) until **Check live**, including on launch. A restart with Auto off does not refresh the YouTube token, seed the saved live chat, or rediscover a YouTube live until then. InnerTube chat for a broadcast that is already connected keeps running. If the daily quota is exhausted, official calls pause until midnight Pacific and InnerTube chat continues. That pause is saved with the day's usage, so restarting the app the same Pacific day does not resume official calls.
+Live chat and viewer counts use YouTube’s public site/InnerTube reader, not a polling loop on `liveChatMessages.list`. The viewer number is concurrent viewers (`watching now` or `concurrentViewers`). A lifetime `viewCount` is not shown, and a page scrape does not mark YouTube live by itself. The official API is used sparingly: live-broadcast detection about every 15 seconds until the broadcast is live (same cadence as Twitch and Kick; `liveBroadcasts.list` is 1 unit), then about every 5 minutes while live so ending the stream is noticed without a status call four times a minute. A one-shot history seed runs when a new live chat appears, plus sending and deleting messages, and a slow official chat fallback only if InnerTube fails. Leaving Auto on while YouTube is offline all day is about 5,800 units, so uncheck it if the app stays open and you are not about to go live. **Check live** in connection settings runs that official status check immediately without changing the automatic interval. The **Auto** box beside it is on by default for Twitch, Kick, and YouTube. Uncheck it to skip that platform’s automatic live-status polls. Chat that is already connected keeps updating. Going live or offline, and viewer counts from those polls, stay as last seen until you press **Check live**. For YouTube, Auto off skips the official live-broadcast status call (the quota one) until **Check live**, including on launch. A restart with Auto off does not refresh the YouTube token, seed the saved live chat, or rediscover a YouTube live until then. InnerTube chat for a broadcast that is already connected keeps running. If the daily quota is exhausted, official calls pause until midnight Pacific and InnerTube chat continues. That pause is saved with the day's usage, so restarting the app the same Pacific day does not resume official calls.
 
 If you run two **separate** live broadcasts at the same time — a normal 16:9 stream and a vertical Shorts stream — put `#shortsfeed` in the title of the vertical/Shorts broadcast only. The dock then labels that chat **Shorts** and the other chat **Live**, without spending extra API calls to guess which is which. If only one live broadcast is up, the labels stay hidden. If your single scheduled livestream already feeds both 16:9 and vertical viewers at once, this tag is not needed and may not be honored.
 
-We do not use `search.list` (historically expensive). YouTube subscribers are StreamElements-only. A backend restart reloads `data/chat.json` and skips another YouTube history API call when that live chat is already on disk.
+We do not use `search.list` (historically expensive). YouTube subscribers are StreamElements-only, and they were not shown before 0.9.3. A backend restart reloads `data/chat.json` and skips another YouTube history API call when that live chat is already on disk.
 
 If a YouTube broadcast is unlisted or private, the companion window and the chat dock each show that broadcast's title (`YouTube “Night stream” is unlisted.`). That can be intentional, or a leftover from reusing an unlisted stream. **Make public** sets only that video to public (a 50-unit `videos.update`, only when you confirm). **Dismiss** hides that video's warning until the app restarts; the next broadcast still warns. The post-stream check is a 1-unit `videos.list` about every 3 minutes for 30 minutes after the broadcast leaves the live list, so it does not add a poll while you are live.
 
@@ -176,7 +178,7 @@ STREAMELEMENTS_JWT_KICK=
 STREAMELEMENTS_JWT_YOUTUBE=
 ```
 
-The docks, companion, and control API stay on this computer until Watch is turned on. Packaged runs store `data/` beside the executable; `RELAY_DATA_DIR` overrides the location.
+The docks, companion, and control API stay on this computer until Watch is turned on. Packaged runs store `data/` beside the executable; `RELAY_DATA_DIR` overrides the location. On launch, new keys from `.env.example` are merged into `production.env` with an atomic replace, so a crash during that rewrite does not wipe existing secrets. A failed title save, a Kick status error, or a locked settings file is logged and the relay keeps running.
 
 ### Readonly LAN watch link
 
@@ -227,22 +229,24 @@ The banner waits before it complains. StreamElements hydrates its JWTs over the 
 
 The funnel next to the flask filters by kind (Follow, Sub/gift, Cheer/raid, Donation/merch, Super Chat/membership) without a second toolbar. Combine it with the platform icons. All kinds are on by default.
 
-Newest alerts stay at the top; older rows drop down. Each row shows the platform logo first, then the event type. Click a row to open that user's Twitch viewer card, Kick profile, or YouTube channel page in the system browser (not inside the OBS dock). Both docks paint only the on-screen rows.
+Newest alerts stay at the top; older rows drop down. Each row shows the platform logo first, then the event type. Left-click a row to open that user's Twitch viewer card, Kick profile, or YouTube channel page in the system browser (not inside the OBS dock). Both docks paint only the on-screen rows.
+
+**Right-click a pill to delete it.** An X slides out from the right side. Click the X to remove that alert from the dock and from `activity.json`. Right-click again, or wait 5 seconds, and the X hides without deleting. Emulated alerts are saved like real ones, so this is how you clear a test. The watch page does not get this control.
 
 **Drop alerts older than 30 days** is off by default so quieter streams keep a long history. Turn it on to automatically remove events older than 30 days.
 
-**Use connected accounts as backup for StreamElements** is on by default. Turn it off if you do not want native Twitch/Kick/YouTube events as a fallback. The same alert is dropped when the user id matches, or when the login and display name collapse to the same letters (`Cool User` and `cooluser`). Follows, raids, and memberships still collapse across the startup backfill. Subs, gifts, cheers, and donations only collapse within two minutes, and only when the amount matches. A YouTube member join is a membership on both feeds, not a follow.
+**Use connected accounts as backup for StreamElements** is on by default. Turn it off if you do not want native Twitch/Kick/YouTube events as a fallback. The same alert is dropped when the user id matches, or when the login and display name collapse to the same letters (`Cool User` and `cooluser`). Follows, raids, and memberships still collapse across the startup backfill. Subs, gifts, cheers, and donations only collapse within two minutes, and only when the amount matches. A YouTube member join is a membership. A YouTube subscriber is its own alert, not a member. Subscribers were not shown before 0.9.3.
 
 Hiding or skipping an event in the StreamElements dashboard does **not** remove it here. SE does not publish a hide/delete activity event over the websocket we use.
 
-Activity test rows from `/api/activity/test` are in-memory only and are not saved to disk.
+The flask fires a StreamElements mock activity, the same call the overlay editor makes when Preview LIVE on stream is checked. The row shows up when that event comes back on the activities socket, and it is saved like any other alert. A replay of an alert already in history is dropped, because StreamElements reuses the activity id.
 
 Activity history is stored locally in `data/activity.json` (last 5000 real events by default, or 30 days if that setting is on). Chat history is stored locally in `data/chat.json`. Think of `data/chat.json` as a crash buffer: it lets a backend restart (or OBS refresh) reload the last messages so the dock never comes back empty mid-stream. It is not a full archive or a VOD: messages that arrived while the backend was down are never backfilled. The chat buffer holds the last 5000 messages by default; set `RELAY_CHAT_MAX` in `production.env` to a value from 100 to 1,000,000 to keep more or fewer. Activity uses the same range via `RELAY_ACTIVITY_MAX`. The number is the trade-off: memory and the size of `chat.json` / `activity.json` both scale with it, so a high-volume stream might set 50,000 while a small one can lower it. Installer copies keep `production.env` and `data\` under `%LOCALAPPDATA%\Relay Chat Dock`. Portable zips keep those files beside the exe. Development runs keep them under the project directory. `RELAY_DATA_DIR` overrides any of those. Token, settings, chat, and activity files are written atomically with a `.bak` fallback so a crash during save does not wipe credentials or history. Restarting the backend reloads both files, so the docks are not empty. Past messages from while the backend was down do not appear: Twitch and Kick have no cheap replay, and YouTube liveChat history is skipped when this live chat is already on disk so a restart does not spend extra quota filling the gap.
 
 ### Testing alerts
 
-1. Open the Activity dock and click the flask icon. That injects a local test row through `/api/activity/test`. It proves the dock and filters without hitting platform APIs, and it is not persisted.
-2. With JWTs in `production.env`, replay an event from the SE dashboard activity feed. Overlay **Emulate** usually only hits the overlay iframe, not this dock.
+1. Open the Activity dock and click the flask icon. That posts a StreamElements emulate (`POST /activities/{channel}/mock`) for the platform's JWT. The live overlay plays it, and the dock shows the row when the activities socket delivers it. This needs the matching StreamElements JWT.
+2. Overlay **Emulate** with **Preview LIVE on stream** checked is the same call. Without that box, Emulate stays in the editor tab and this dock does not see it. Replaying an activity already in the feed is dropped here, because the id does not change.
 3. Native backup (if the settings checkbox is on): reconnect Twitch so follow/sub/bits EventSub is granted, then follow from an alt. Kick follows/subs appear on the public chat socket. YouTube Super Chats/memberships appear in live chat. YouTube subscribers are SE-only.
 
 ## Run the Windows app
@@ -285,7 +289,8 @@ Loopback (this computer) can call every route with no token. Off this computer t
 - `POST /api/moderate` - delete a message, or timeout, ban, or unban a chatter. Twitch and Kick accept an optional `reason` (trimmed, max 500, omitted when blank). YouTube ignores `reason` because `liveChat/bans` has no reason field
 - `POST /api/youtube/privacy` - set a warned YouTube broadcast or archive to public, or dismiss that warning. Only ids the backend is already warning about are accepted
 - `POST /api/open` - open an allowlisted link in the system browser: Twitch profiles and channel-scoped viewer cards (`/popout/<channel>/viewercard/<login>`), Kick profiles, YouTube channel or `@handle` pages, creator dashboards, and YouTube Studio
-- `POST /api/activity/test` - inject a local test activity row (not persisted)
+- `POST /api/activity/test` - fire a StreamElements emulate for that platform and kind. The overlay plays it. The dock row arrives on the activities socket, not as a local inject. YouTube subscriber uses kind `subscription`
+- `POST /api/activity/delete` - remove one stored activity by id. This computer only
 - `GET /api/categories/:platform` - search Twitch or Kick categories
 - `POST /api/stream-info/:platform` - apply title/category/tags to one platform
 - `POST /api/stream-info` - apply shared title plus per-platform Twitch/Kick category and tags

@@ -10,7 +10,7 @@ import cors from 'cors'
 import WebSocket from 'ws'
 import { createServer } from 'node:http'
 import { KickChat, lookupKickProfilePics, type KickActivity, type KickModeration } from './kick-chat.js'
-import { YouTubeLiveChat, type YouTubeChatMessage, type YouTubeChatTarget, type YouTubeModeration } from './youtube-chat.js'
+import { YouTubeLiveChat, youtubeViewersWhileLive, type YouTubeChatMessage, type YouTubeChatTarget, type YouTubeModeration } from './youtube-chat.js'
 import { ACTIVITY_MAX_AGE_MS, createActivityStore, kickProfileSlug, type ActivityEvent } from './activity.js'
 import { looksLikeJwt, resolveEnvFilePath, resolveEnvTemplatePath, setEnvKey, STREAMELEMENTS_JWT_KEYS, syncEnvFile, writeTextAtomic } from './env-file.js'
 
@@ -23,7 +23,7 @@ import { fetchMedia } from './media-proxy.js'
 import { createLogBuffer } from './log-buffer.js'
 import { createLogFile, resolveLogFilePath } from './log-file.js'
 import { createHostSession, findCompanionExe, nativeWindowPlan, serverShouldOpenWindow, windowsMessageBox } from './console-window.js'
-import { StreamElementsClient, fetchRecentActivities, hydrateStreamElements } from './streamelements.js'
+import { StreamElementsClient, fetchRecentActivities, hydrateStreamElements, postStreamElementsMock, streamElementsEmulateName, streamElementsEmulatePlan, streamElementsMockActivity } from './streamelements.js'
 import { checkForUpdates, getCurrentVersion, isDesktopPackaged } from './check-update.js'
 import { installRelayObsDocks, obsProcessRunning, operatorFilesDir } from './obs-docks.js'
 import {
@@ -45,6 +45,7 @@ import {
   isTokenRefreshHealthMessage,
   normalizeChatHandle,
   kickBadges,
+  kickChannelPollFailure,
   kickModerationBanPayload,
   kickStreamDetails,
   normalizeTags,
@@ -62,6 +63,7 @@ import {
   parseActivityMax,
   parseChatMax,
   activitySseFields,
+  applyOutgoingSendResult,
   parseKickParts,
   parseTranslatedText,
   parseTwitchChatLine,
@@ -90,6 +92,7 @@ import {
   twitchEventSubCloseAction,
   twitchEventSubConnectPlan,
   twitchEventSubRetryDelay,
+  twitchEventSubSubscribeStillCurrent,
   twitchEventSubWatchdogShouldClose,
   twitchEventToActivity,
   youtubeApiErrorReason,
@@ -99,6 +102,7 @@ import {
   youtubeLiveChatBanSnippet,
   youtubeLiveChatCursor,
   youtubeLiveChatListQuery,
+  youtubeInsertedMessageId,
   youtubeLiveChatMessageBody,
   youtubeScrapedTarget,
   youtubeOfficialModeration,
@@ -198,9 +202,9 @@ process.on('uncaughtException', (error) => {
   console.error(error)
   holdConsoleAndExit(1, error instanceof Error ? error.stack || error.message : String(error))
 })
+// A rejected poll or save must not blank the docks. Startup failures still call holdConsoleAndExit directly.
 process.on('unhandledRejection', (error) => {
   console.error(error)
-  holdConsoleAndExit(1, error instanceof Error ? error.stack || error.message : String(error))
 })
 
 try { fs.mkdirSync(filesDir, { recursive: true }) } catch { /* ignore */ }
@@ -542,15 +546,9 @@ app.post('/api/messages', async (request, response) => {
   rememberOutgoing({ id, text: trimmed, platforms, at: Date.now() })
   addMessage({ id, platform: platforms[0], platforms, user, text: trimmed, time: new Date().toISOString() }, { source: 'send' })
   const results = await Promise.all(platforms.map((platform) => sendMessage(platform, trimmed)))
-  const sentPlatforms = results.filter((result) => result.ok).map((result) => result.platform)
-  const existing = state.messages.find((item) => item.id === id)
-    || state.messages.find((item) => item.text === trimmed && ownHandles().has(item.user.toLowerCase()) && Math.abs(Date.parse(item.time) - Date.now()) < 20_000)
-  if (existing) {
-    if (!sentPlatforms.length) state.messages = state.messages.filter((item) => item.id !== existing.id)
-    else {
-      existing.platforms = sentPlatforms
-      existing.platform = sentPlatforms[0]
-    }
+  const applied = applyOutgoingSendResult(state.messages, id, results)
+  if (applied.changed) {
+    state.messages = applied.messages
     scheduleChatSave()
     broadcast()
   }
@@ -627,13 +625,18 @@ app.post('/api/stream-info/:platform', async (request, response) => {
   const { title, category, categoryId, tags } = request.body as Partial<StreamDetails>
   const normalizedTags = normalizeTags(tags)
   const details = { title: String(title || '').trim(), category: String(category || '').trim(), ...(categoryId ? { categoryId: String(categoryId) } : {}), ...(normalizedTags ? { tags: normalizedTags } : {}) }
-  const result = await updateStreamInfo(platform, details)
-  if (result.ok) {
-    state.streamInfo[platform] = details
-    persistStreamInfo()
+  try {
+    const result = await updateStreamInfo(platform, details)
+    if (result.ok) {
+      state.streamInfo[platform] = details
+      persistStreamInfo()
+    }
+    broadcast()
+    response.json({ streamInfo: state.streamInfo, results: [result] })
+  } catch (error) {
+    console.error('Stream info:', error instanceof Error ? error.message : error)
+    if (!response.headersSent) response.status(502).json({ error: error instanceof Error ? error.message : 'Could not update stream info' })
   }
-  broadcast()
-  response.json({ streamInfo: state.streamInfo, results: [result] })
 })
 app.post('/api/stream-info', async (request, response) => {
   const { title, Twitch, Kick } = request.body as { title?: string; Twitch?: StreamDetails; Kick?: StreamDetails }
@@ -642,16 +645,21 @@ app.post('/api/stream-info', async (request, response) => {
     Twitch: { category: '', ...Twitch, title: sharedTitle, tags: normalizeTags(Twitch?.tags) || [] },
     Kick: { category: '', ...Kick, title: sharedTitle, tags: normalizeTags(Kick?.tags) || [] },
   }
-  const results = await Promise.all((['Twitch', 'Kick'] as StreamPlatform[]).map((platform) => updateStreamInfo(platform, detailsByPlatform[platform])))
-  let changed = false
-  for (const result of results) {
-    if (!result.ok || ('skipped' in result && result.skipped)) continue
-    state.streamInfo[result.platform] = detailsByPlatform[result.platform]
-    changed = true
+  try {
+    const results = await Promise.all((['Twitch', 'Kick'] as StreamPlatform[]).map((platform) => updateStreamInfo(platform, detailsByPlatform[platform])))
+    let changed = false
+    for (const result of results) {
+      if (!result.ok || ('skipped' in result && result.skipped)) continue
+      state.streamInfo[result.platform] = detailsByPlatform[result.platform]
+      changed = true
+    }
+    if (changed) persistStreamInfo()
+    broadcast()
+    response.json({ streamInfo: state.streamInfo, results })
+  } catch (error) {
+    console.error('Stream info:', error instanceof Error ? error.message : error)
+    if (!response.headersSent) response.status(502).json({ error: error instanceof Error ? error.message : 'Could not update stream info' })
   }
-  if (changed) persistStreamInfo()
-  broadcast()
-  response.json({ streamInfo: state.streamInfo, results })
 })
 app.post('/api/settings', async (request, response) => {
   const body = request.body as { activityFallback?: boolean; ignoreMissingJwt?: boolean; dropOldAlerts?: boolean; translateChat?: boolean; autoLiveCheck?: Partial<Record<Platform, boolean>>; lanWatch?: boolean }
@@ -754,7 +762,12 @@ app.post('/api/jwts', async (request, response) => {
   }
   let failed: Array<{ platform: 'Twitch' | 'Kick' | 'YouTube'; message: string }> = []
   if (saved.length) {
-    writeTextAtomic(envPath, text)
+    try {
+      writeTextAtomic(envPath, text)
+    } catch (error) {
+      console.error('StreamElements JWT save:', error instanceof Error ? error.message : error)
+      return response.status(500).json({ error: 'Could not save StreamElements JWTs' })
+    }
     failed = await startStreamElements(false)
   }
   const slots = streamElementsJwtSlots()
@@ -765,25 +778,35 @@ app.post('/api/jwts', async (request, response) => {
   })
 })
 app.post('/api/open', createOpenHandler(openInDefaultBrowser))
-app.post('/api/activity/test', (request, response) => {
+app.post('/api/activity/delete', (request, response) => {
+  const id = String((request.body as { id?: string } | undefined)?.id || '').trim()
+  if (!id) return response.status(400).json({ error: 'id is required' })
+  if (!activityStore.remove(id)) return response.status(404).json({ error: 'Activity not found' })
+  state.activity = activityStore.list()
+  broadcast()
+  response.json({ ok: true })
+})
+app.post('/api/activity/test', async (request, response) => {
   const body = request.body as Partial<ActivityEvent>
   const platform = body.platform
   const kind = body.kind
   if (!platform || !kind) return response.status(400).json({ error: 'platform and kind are required' })
-  const event: ActivityEvent = {
-    id: `test-${crypto.randomUUID()}`,
-    platform,
-    kind,
-    user: String(body.user || 'TestUser'),
-    amount: body.amount,
-    months: body.months,
-    viewers: body.viewers,
-    message: body.message || 'Test alert',
-    time: new Date().toISOString(),
-    source: body.source,
+  const plan = streamElementsEmulatePlan(platform, kind)
+  if (!plan) return response.status(400).json({ error: 'That test is not a StreamElements emulate option' })
+  try {
+    const channel = await streamElementsChannelFor(plan.provider, platform === 'StreamElements')
+    if (!channel) return response.status(400).json({ error: `Connect StreamElements for ${plan.provider} first` })
+    const provider = (channel.provider || plan.provider).toLowerCase()
+    const name = streamElementsEmulateName()
+    const activity = streamElementsMockActivity({ ...plan, provider, name })
+    await postStreamElementsMock(channel, activity)
+    console.log(`StreamElements emulate: ${provider} ${plan.type} (${name})`)
+    response.json({ ok: true, name, type: plan.type })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'StreamElements emulate failed'
+    console.error(message)
+    response.status(502).json({ error: message })
   }
-  addActivity(event)
-  response.json({ ok: true, event })
 })
 app.post('/api/disconnect/:platform', (request, response) => {
   const platform = ['Twitch', 'Kick', 'YouTube'].find((item) => item.toLowerCase() === request.params.platform.toLowerCase()) as Platform | undefined
@@ -1516,7 +1539,7 @@ function connectTwitchEventSub(url = TWITCH_EVENTSUB_DEFAULT_URL) {
       if (plan.resume) { twitchEventSubReady = true; console.log('Twitch EventSub resumed') }
       else {
         twitchEventSubSessionId = String(payload.payload.session.id || '')
-        void subscribeTwitchEvents(twitchEventSubSessionId)
+        void subscribeTwitchEvents(twitchEventSubSessionId, generation)
       }
     } else if (type === 'notification') {
       handleTwitchEventSub(payload)
@@ -1561,7 +1584,7 @@ const twitchEventSubs: { type: string; version: string; condition: (userId: stri
   { type: 'channel.raid', version: '1', condition: (userId) => ({ to_broadcaster_user_id: userId }), activity: true },
 ]
 
-async function subscribeTwitchEvents(sessionId: string) {
+async function subscribeTwitchEvents(sessionId: string, generation = twitchEventSubGeneration) {
   const token = await ensureToken('Twitch')
   if (!token?.userId) return
   const transport = { method: 'websocket', session_id: sessionId }
@@ -1593,6 +1616,10 @@ async function subscribeTwitchEvents(sessionId: string) {
         if (spec.type === 'channel.unban' && (message.includes('403') || message.includes('401') || message.includes('scope'))) moderationFailed = true
       }
     }
+  }
+  if (!twitchEventSubSubscribeStillCurrent(generation, sessionId, twitchEventSubGeneration, twitchEventSubSessionId || '')) {
+    console.log('Twitch EventSub subscribe finished for a session that is no longer current')
+    return
   }
   if (chatOk) {
     twitchEventSubReady = true
@@ -2022,6 +2049,24 @@ function addNativeActivity(event: ActivityEvent) {
   addActivity(event)
 }
 
+async function streamElementsChannelFor(provider: string, anyChannel = false) {
+  const wanted = provider.toLowerCase()
+  const loaded = streamElements.loadedChannels.find((channel) => (channel.provider || '').toLowerCase() === wanted)
+  if (loaded) return loaded
+  if (anyChannel && streamElements.loadedChannels[0]) return streamElements.loadedChannels[0]
+  const jwtPlatform = wanted === 'kick' ? 'Kick' : wanted === 'youtube' ? 'YouTube' : 'Twitch'
+  const jwt = String(process.env[STREAMELEMENTS_JWT_KEYS[jwtPlatform]] || '').trim()
+  if (!jwt && anyChannel) {
+    for (const platform of ['Twitch', 'Kick', 'YouTube'] as const) {
+      const fallback = String(process.env[STREAMELEMENTS_JWT_KEYS[platform]] || '').trim()
+      if (!fallback) continue
+      return hydrateStreamElements(fallback)
+    }
+  }
+  if (!jwt) return
+  return hydrateStreamElements(jwt)
+}
+
 function streamElementsJwtSlots() {
   return [
     { platform: 'Twitch' as const, jwt: String(process.env.STREAMELEMENTS_JWT_TWITCH || '').trim() },
@@ -2141,6 +2186,7 @@ async function pollLiveState() {
   if (livePollInFlight) return
   livePollInFlight = true
   try {
+  try {
   const twitchAccount = state.accounts.find((item) => item.platform === 'Twitch')
   const kickAccount = state.accounts.find((item) => item.platform === 'Kick')
   const twitchWasLive = Boolean(twitchAccount?.live)
@@ -2183,6 +2229,10 @@ async function pollLiveState() {
   persistStreamInfo()
   refreshChatHealth()
   broadcast()
+  } catch (error) {
+    // A locked settings file or a thrown status poll must not reject void pollLiveState() and exit.
+    console.error('Live status poll:', error instanceof Error ? error.message : error)
+  }
   } finally {
     livePollInFlight = false
   }
@@ -2454,8 +2504,9 @@ async function refreshYouTubeViewers() {
   const viewers = counts.reduce((total, count) => total + count, 0)
   const account = state.accounts.find((item) => item.platform === 'YouTube')
   if (!account) return
-  if (account.viewers === viewers && account.live && !labelsChanged) return
-  Object.assign(account, { live: true, viewers })
+  const next = youtubeViewersWhileLive(account.live, account.viewers, viewers)
+  if (!next && !labelsChanged) return
+  if (next) Object.assign(account, next)
 }
 
 async function seedYouTubeHistory(token: Token) {
@@ -2585,8 +2636,10 @@ async function pollKick() {
   if (!token) return
   const response = await kickApi('/channels', token)
   if (!response.ok) {
-    if (response.status === 401) await refreshAccessToken('Kick')
-    return
+    const failure = kickChannelPollFailure(response.status)
+    await response.text().catch(() => '')
+    if (failure?.refresh) await refreshAccessToken('Kick')
+    throw new Error(failure?.message || `Kick status poll failed (${response.status})`)
   }
   const payload = await response.json() as any
   const channel = payload.data?.[0]
@@ -2681,13 +2734,18 @@ async function sendYouTubeMessage(text: string) {
   }
   const guard = youtubeSendGuard({ connected: true, quotaBlocked: false, chatIds })
   if (guard.ok === false) return guard
-  const results = await Promise.all(chatIds.map((liveChatId) => youtubeRequest('/liveChat/messages?part=snippet', token, {
+  const results = await Promise.all(chatIds.map(async (liveChatId) => ({ liveChatId, result: await youtubeRequest('/liveChat/messages?part=snippet', token, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(youtubeLiveChatMessageBody(liveChatId, text)),
-  })))
-  const failed = results.filter((result) => !result.ok)
-  return { ok: results.some((result) => result.ok), error: failed.length ? failed.map((result) => youtubeApiErrorReason(result.text)).join(' | ') : undefined }
+  }) })))
+  const failed = results.filter((item) => !item.result.ok)
+  const sent = results.flatMap((item) => {
+    if (!item.result.ok) return []
+    const id = youtubeInsertedMessageId(item.result.text)
+    return id ? [{ id, sourceId: item.liveChatId }] : []
+  })
+  return { ok: results.some((item) => item.result.ok), error: failed.length ? failed.map((item) => youtubeApiErrorReason(item.result.text)).join(' | ') : undefined, ...(sent.length ? { sent } : {}) }
 }
 
 async function moderate(platform: Platform, body: { action: string; messageId?: string; userId?: string; sourceId?: string; duration?: number; reason?: string }) {
@@ -2838,8 +2896,12 @@ async function updateStreamInfo(platform: StreamPlatform, info: StreamDetails) {
   }
   if (platform === 'Kick') {
     const tags = kickTagsForApi(info.tags)
-    const response = await kickApi('/channels', undefined, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stream_title: info.title, ...(info.categoryId ? { category_id: Number(info.categoryId) } : {}), ...(tags ? { custom_tags: tags } : {}) }) })
-    return { platform, ok: response.ok, error: response.ok ? undefined : await response.text() }
+    try {
+      const response = await kickApi('/channels', undefined, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stream_title: info.title, ...(info.categoryId ? { category_id: Number(info.categoryId) } : {}), ...(tags ? { custom_tags: tags } : {}) }) })
+      return { platform, ok: response.ok, error: response.ok ? undefined : await response.text() }
+    } catch (error) {
+      return { platform, ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
   }
   return { platform, ok: false, error: 'Unsupported stream platform' }
 }

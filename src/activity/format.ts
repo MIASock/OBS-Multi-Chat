@@ -15,6 +15,12 @@ export const kindLabel = {
   merch: 'MERCH',
 } as const
 
+export function activityKindLabel(event: { platform: string; kind: string }) {
+  if (event.platform === 'YouTube' && event.kind === 'subscription') return 'SUBSCRIBER'
+  if (event.platform === 'Kick' && event.kind === 'cheer') return 'KICKS'
+  return kindLabel[event.kind as keyof typeof kindLabel] || event.kind.toUpperCase()
+}
+
 export const ACTIVITY_KIND_GROUPS = [
   { id: 'follow', label: 'Follow', kinds: ['follow'] },
   { id: 'sub', label: 'Sub / gift', kinds: ['subscription', 'gift'] },
