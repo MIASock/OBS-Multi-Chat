@@ -41,7 +41,10 @@ import {
   extractSession,
   extractVideoId,
   innerTubeRetryDelay,
+  isRequestTimeout,
+  noteYoutubeBrowserMiss,
   youtubeBrowserAllowed,
+  YOUTUBE_BROWSER_MISS_TTL_MS,
   nextContinuation,
   parseActions,
   parseModerationActions,
@@ -345,6 +348,70 @@ describe('YouTube message ingest', () => {
     assert.equal(echoed.messages[1].id, 'helix-2')
   })
 
+  it('merges a Kick echo into the unified send after Twitch already replaced the dock id', () => {
+    const outgoing = chat({
+      id: 'local',
+      platform: 'Twitch',
+      platforms: ['Twitch', 'Kick', 'YouTube'],
+      user: 'Host',
+      text: 'hello',
+      time: '2026-09-02T12:00:00.000Z',
+    })
+    const recent = [{ id: 'local', text: 'hello', platforms: ['Twitch', 'Kick', 'YouTube'] as const, at: Date.parse(outgoing.time) }]
+    const ctx = { ownHandles: own('Host'), recentOutgoing: recent }
+    const afterTwitch = mergeIncomingChat([outgoing], chat({
+      id: 'helix-1',
+      platform: 'Twitch',
+      user: 'Host',
+      text: 'hello',
+      time: '2026-09-02T12:00:01.000Z',
+    }), undefined, ctx)
+    assert.equal(afterTwitch.messages.length, 1)
+    assert.equal(afterTwitch.messages[0].id, 'helix-1')
+    const afterKick = mergeIncomingChat(afterTwitch.messages, chat({
+      id: 'kick-1',
+      platform: 'Kick',
+      user: 'milzstream',
+      text: 'hello',
+      time: '2026-09-02T12:00:02.000Z',
+    }), undefined, ctx)
+    assert.equal(afterKick.messages.length, 1)
+    assert.deepEqual(afterKick.messages[0].platforms, ['Twitch', 'Kick', 'YouTube'])
+    assert.equal(afterKick.messages[0].copies?.find((copy) => copy.platform === 'Kick')?.id, 'kick-1')
+  })
+
+  it('merges a Twitch echo into the unified send after Kick already replaced the dock id', () => {
+    const outgoing = chat({
+      id: 'local',
+      platform: 'Twitch',
+      platforms: ['Twitch', 'Kick'],
+      user: 'Host',
+      text: 'hello',
+      time: '2026-09-02T12:00:00.000Z',
+    })
+    const recent = [{ id: 'local', text: 'hello', platforms: ['Twitch', 'Kick'] as const, at: Date.parse(outgoing.time) }]
+    const ctx = { ownHandles: own('Host'), recentOutgoing: recent }
+    const afterKick = mergeIncomingChat([outgoing], chat({
+      id: 'kick-1',
+      platform: 'Kick',
+      user: 'milzstream',
+      text: 'hello',
+      time: '2026-09-02T12:00:01.000Z',
+    }), undefined, ctx)
+    assert.equal(afterKick.messages.length, 1)
+    assert.equal(afterKick.messages[0].id, 'kick-1')
+    const afterTwitch = mergeIncomingChat(afterKick.messages, chat({
+      id: 'helix-1',
+      platform: 'Twitch',
+      user: 'Host',
+      text: 'hello',
+      time: '2026-09-02T12:00:02.000Z',
+    }), undefined, ctx)
+    assert.equal(afterTwitch.messages.length, 1)
+    assert.deepEqual(afterTwitch.messages[0].platforms, ['Twitch', 'Kick'])
+    assert.equal(afterTwitch.messages[0].copies?.find((copy) => copy.platform === 'Twitch')?.id, 'helix-1')
+  })
+
   it('does not delete an earlier own line when a later identical send fails', () => {
     const messages = [
       chat({ id: 'local-1', platform: 'Twitch', user: 'Host', text: 'lol', time: '2026-09-02T12:00:00.000Z' }),
@@ -556,5 +623,17 @@ describe('YouTube InnerTube moderation', () => {
     missed.add('video')
     assert.equal(youtubeBrowserAllowed('video', missed), false)
     assert.equal(youtubeBrowserAllowed('other', missed), true)
+  })
+
+  it('does not keep a browser miss after a timeout, and expires a real miss', () => {
+    const missed = new Map<string, number>()
+    assert.equal(isRequestTimeout(new Error('Request timed out after 12000ms')), true)
+    assert.equal(isRequestTimeout(Object.assign(new Error('Timeout 30000ms exceeded'), { name: 'TimeoutError' })), true)
+    noteYoutubeBrowserMiss('video', new Error('Request timed out after 12000ms'), missed, 1_000)
+    assert.equal(youtubeBrowserAllowed('video', missed, 1_000), true)
+    noteYoutubeBrowserMiss('video', new Error('browser miss'), missed, 1_000)
+    assert.equal(youtubeBrowserAllowed('video', missed, 1_000), false)
+    assert.equal(youtubeBrowserAllowed('video', missed, 1_000 + YOUTUBE_BROWSER_MISS_TTL_MS), true)
+    assert.equal(missed.has('video'), false)
   })
 })

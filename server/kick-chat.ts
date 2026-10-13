@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import WebSocket from 'ws'
+import { fetchTimed, type FetchLike } from './fetch-timed.js'
 
 /**
  * Kick chat, activity, and moderation over Kick's public Pusher WebSocket, plus
@@ -16,8 +17,7 @@ export type KickChatMessage = { id?: string; user: string; text: string; userId?
 export type KickActivity = { id?: string; kind: 'follow' | 'subscription' | 'gift' | 'cheer' | 'raid'; user: string; userId?: string; slug?: string; amount?: string; months?: number; viewers?: number; message?: string; time?: string }
 export type KickModeration = { action: 'delete' | 'ban' | 'unban'; messageId?: string; userId?: string; user?: string; slug?: string }
 
-/** Kick's public Pusher app, used by the site for all real-time chat events. */
-const PUSHER_URL = 'wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=8.4.0&flash=false'
+const KICK_CLIENT_ID = `relay-${process.pid}`
 export const BROWSER_HEADERS = {
   Accept: 'application/json',
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
@@ -48,7 +48,8 @@ export function parseJson(value: unknown) {
 export type KickSocketFrame = {
   event: string
   channel?: string
-  handshake?: 'connect' | 'ping' | 'subscribed'
+  handshake?: 'connect' | 'ping' | 'subscribed' | 'error'
+  error?: string
   message?: KickChatMessage
   moderation?: KickModeration
   activity?: KickActivity
@@ -61,6 +62,10 @@ export function readKickSocketFrame(raw: unknown): KickSocketFrame | undefined {
   if (!event) return
   const channelValue = (payload as { channel?: unknown }).channel
   const channel = channelValue ? String(channelValue) : undefined
+  if (event === 'pusher:error') {
+    const data = parseJson((payload as { data?: unknown }).data) || (payload as { data?: { message?: unknown } }).data
+    return { event, channel, handshake: 'error', error: String((data as { message?: unknown })?.message || 'Pusher error') }
+  }
   if (event === 'pusher:connection_established') return { event, channel, handshake: 'connect' }
   if (event === 'pusher:ping') return { event, channel, handshake: 'ping' }
   if (event === 'pusher_internal:subscription_succeeded') return { event, channel, handshake: 'subscribed' }
@@ -77,6 +82,45 @@ export function readKickSocketFrame(raw: unknown): KickSocketFrame | undefined {
     channel,
     moderation,
     activity: activity && rawTime ? { ...activity, time: String(rawTime) } : activity,
+  }
+}
+
+export function kickRealtimeRequest(clientId = KICK_CLIENT_ID) {
+  return {
+    client: { id: clientId, type: 'web' },
+    capabilities: { accepted_providers: [{ provider: 'pusher' }, { provider: 'centrifugo' }] },
+  }
+}
+
+export function kickRealtimePlan(payload: any): { provider: 'centrifugo'; url: string } | { provider: 'pusher'; url: string } | undefined {
+  const connections = payload?.data?.connections || payload?.connections || []
+  for (const item of connections) {
+    const credentials = item?.credentials || {}
+    if (item?.provider === 'centrifugo' && credentials.url) return { provider: 'centrifugo', url: String(credentials.url) }
+    if (item?.provider === 'pusher' && credentials.app_key && credentials.cluster) {
+      return { provider: 'pusher', url: `wss://ws-${credentials.cluster}.pusher.com/app/${credentials.app_key}?protocol=7&client=js&version=8.4.0&flash=false` }
+    }
+  }
+}
+
+export function kickRealtimeToken(payload: any) {
+  const token = payload?.data?.token || payload?.token
+  return typeof token === 'string' && token ? token : undefined
+}
+
+export function readKickCentrifugoFrame(raw: string) {
+  const payload = parseJson(raw)
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return
+  if (!Object.keys(payload).length) return { kind: 'ping' as const }
+  if (payload.error) return { kind: 'error' as const, message: String(payload.error.message || payload.error.code || 'realtime error') }
+  if (payload.connect) return { kind: 'connected' as const }
+  if (payload.subscribe && payload.id) return { kind: 'subscribed' as const, id: Number(payload.id) }
+  const data = payload.push?.pub?.data
+  if (!data || typeof data !== 'object' || !data.event) return
+  return {
+    kind: 'publication' as const,
+    channel: payload.push.channel ? String(payload.push.channel) : undefined,
+    frame: { event: String(data.event), channel: payload.push.channel, data: typeof data.data === 'string' ? data.data : data.data },
   }
 }
 
@@ -109,6 +153,46 @@ export function rememberKickProfilePic(slug: string, payload: any) {
   if (key && pic) kickProfilePicCache.set(key, pic)
 }
 
+export const KICK_PAGE_FETCH_MS = 12_000
+
+export function kickPageFetch(url: string, init: RequestInit = {}, fetchImpl?: FetchLike, ms = KICK_PAGE_FETCH_MS) {
+  return fetchTimed(url, init, ms, fetchImpl ?? fetch)
+}
+
+export function createFlushLock() {
+  let running = false
+  let pending = false
+  return {
+    async run(task: () => Promise<void>) {
+      if (running) {
+        pending = true
+        return
+      }
+      running = true
+      try {
+        do {
+          pending = false
+          await task()
+        } while (pending)
+      } finally {
+        running = false
+      }
+    },
+  }
+}
+
+export function kickSocketShouldStay(readyState?: number) {
+  return readyState === WebSocket.CONNECTING || readyState === WebSocket.OPEN
+}
+
+export function dropSocket(socket?: { removeAllListeners: (event?: string) => void; on: (event: string, listener: () => void) => void; terminate: () => void }) {
+  if (!socket) return
+  socket.removeAllListeners('message')
+  socket.removeAllListeners('close')
+  socket.on('error', () => undefined)
+  try { socket.terminate() } catch { /* already closed */ }
+}
+
 /** Resolve a channel's public chatroom id. Node fetch is often Cloudflare-blocked; Windows PowerShell then a real browser are the fallbacks. */
 export async function resolveKickChatroomId(slug: string, cached?: number): Promise<number> {
   if (cached && cached > 0) return cached
@@ -119,7 +203,7 @@ export async function resolveKickChatroomId(slug: string, cached?: number): Prom
     `https://kick.com/api/v1/channels/${encodeURIComponent(key)}`,
   ]) {
     try {
-      const response = await fetch(url, { headers: { ...BROWSER_HEADERS, Referer: `https://kick.com/${encodeURIComponent(key)}` } })
+      const response = await kickPageFetch(url, { headers: { ...BROWSER_HEADERS, Referer: `https://kick.com/${encodeURIComponent(key)}` } })
       if (!response.ok) continue
       const payload = await response.json()
       rememberKickProfilePic(key, payload)
@@ -201,7 +285,7 @@ export async function lookupKickProfilePics(slugs: string[]): Promise<Map<string
       continue
     }
     try {
-      const response = await fetch(`https://kick.com/api/v2/channels/${encodeURIComponent(key)}`, {
+      const response = await kickPageFetch(`https://kick.com/api/v2/channels/${encodeURIComponent(key)}`, {
         headers: { ...BROWSER_HEADERS, Referer: `https://kick.com/${encodeURIComponent(key)}` },
       })
       if (response.ok) {
@@ -412,9 +496,13 @@ export class KickChat {
   private onModeration?: (event: KickModeration) => void
   private closed = true
   private attempt = 0
+  private hasFailed = false
+  private provider?: 'centrifugo' | 'pusher'
+  private token?: string
 
   get currentChatroomId() { return this.chatroomId }
   get connected() { return Boolean(this.ws && this.ws.readyState === WebSocket.OPEN && !this.closed) }
+  get failed() { return this.hasFailed }
 
   async start(slug: string, onMessage: (message: KickChatMessage) => void, cachedChatroomId?: number, onActivity?: (event: KickActivity) => void, onModeration?: (event: KickModeration) => void) {
     this.onMessage = onMessage
@@ -424,11 +512,13 @@ export class KickChat {
     if (this.slug !== slug) {
       this.slug = slug
       this.chatroomId = cachedChatroomId
+      this.attempt = 0
+      this.hasFailed = false
       await this.disconnectSocket()
     } else if (cachedChatroomId && !this.chatroomId) {
       this.chatroomId = cachedChatroomId
     }
-    if (this.ws?.readyState === WebSocket.OPEN) return
+    if (kickSocketShouldStay(this.ws?.readyState)) return
     await this.connect()
   }
 
@@ -436,6 +526,8 @@ export class KickChat {
     this.closed = true
     this.slug = undefined
     this.chatroomId = undefined
+    this.attempt = 0
+    this.hasFailed = false
     this.onMessage = undefined
     this.onActivity = undefined
     this.onModeration = undefined
@@ -452,11 +544,30 @@ export class KickChat {
   }
 
   private async openSocket() {
+    try {
+      await this.openSocketNow()
+    } catch (error) {
+      if (this.closed) return
+      console.error('Kick chat:', error instanceof Error ? error.message : error)
+      this.scheduleReconnect()
+    }
+  }
+
+  private async openSocketNow() {
+    if (kickSocketShouldStay(this.ws?.readyState)) return
     if (!this.chatroomId) this.chatroomId = await resolveKickChatroomId(this.slug!, this.chatroomId)
+    if (kickSocketShouldStay(this.ws?.readyState)) return
     await this.disconnectSocket()
+    const plan = await this.realtimePlan()
+    this.provider = plan.provider
+    this.token = plan.token
     console.log(`Kick chat connecting (${this.slug})`)
-    const socket = new WebSocket(PUSHER_URL)
+    const socket = new WebSocket(plan.url, { headers: { Origin: 'https://kick.com', 'User-Agent': BROWSER_HEADERS['User-Agent'] } })
     this.ws = socket
+    socket.on('open', () => {
+      if (this.provider !== 'centrifugo' || !this.token || this.ws !== socket) return
+      socket.send(JSON.stringify({ id: 1, connect: { token: this.token } }))
+    })
     socket.on('message', (data) => this.handle(String(data)))
     socket.on('close', () => {
       if (this.ws !== socket) return
@@ -469,9 +580,58 @@ export class KickChat {
     })
   }
 
-  /** Handle the raw Pusher protocol: connect/subscribe handshake, pings, then chat/activity/moderation events. */
+  private async realtimePlan() {
+    const id = this.chatroomId
+    if (!id) throw new Error('Kick chatroom id is missing')
+    const headers = { ...BROWSER_HEADERS, 'Content-Type': 'application/json', Origin: 'https://kick.com', 'x-app-platform': 'web' }
+    const connection = await kickPageFetch(`https://web.kick.com/api/v1/realtime/channels/${id}/chat/connection`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(kickRealtimeRequest()),
+    })
+    if (!connection.ok) throw new Error(`Kick realtime ${connection.status}`)
+    const plan = kickRealtimePlan(await connection.json())
+    if (!plan) throw new Error('Kick realtime returned no connection')
+    if (plan.provider === 'pusher') return { ...plan, token: undefined }
+    const auth = await kickPageFetch('https://web.kick.com/api/v1/realtime/auth/connection', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ client_id: KICK_CLIENT_ID }),
+    })
+    if (!auth.ok) throw new Error(`Kick realtime token ${auth.status}`)
+    const token = kickRealtimeToken(await auth.json())
+    if (!token) throw new Error('Kick realtime returned no token')
+    return { ...plan, token }
+  }
+
+  private subscribeCentrifugo() {
+    const id = this.chatroomId
+    if (!id || this.ws?.readyState !== WebSocket.OPEN) return
+    this.ws.send(JSON.stringify({ id: 2, subscribe: { channel: `chatrooms.${id}.v2` } }))
+    this.ws.send(JSON.stringify({ id: 3, subscribe: { channel: `chatroom_${id}` } }))
+  }
+
+  /** Handle Pusher or Kick's Centrifugo realtime frames. */
   private handle(raw: string) {
+    if (this.provider === 'centrifugo') {
+      const live = readKickCentrifugoFrame(raw)
+      if (!live) return
+      if (live.kind === 'ping') { this.ws?.send('{}'); return }
+      if (live.kind === 'error') { console.error('Kick chat:', live.message); this.ws?.close(); return }
+      if (live.kind === 'connected') { this.subscribeCentrifugo(); return }
+      if (live.kind === 'subscribed') {
+        if (live.id === 2) { this.attempt = 0; this.hasFailed = false; console.log(`Kick chat connected (${this.slug})`) }
+        return
+      }
+      this.dispatch(readKickSocketFrame(live.frame))
+      return
+    }
     const frame = readKickSocketFrame(raw)
+    if (frame?.handshake === 'error') { console.error('Kick chat:', frame.error); this.ws?.close(); return }
+    this.dispatch(frame)
+  }
+
+  private dispatch(frame: KickSocketFrame | undefined) {
     if (!frame) return
     if (frame.handshake === 'connect') {
       this.ws?.send(JSON.stringify({ event: 'pusher:subscribe', data: { auth: '', channel: `chatrooms.${this.chatroomId}.v2` } }))
@@ -485,6 +645,7 @@ export class KickChat {
     }
     if (frame.handshake === 'subscribed') {
       this.attempt = 0
+      this.hasFailed = false
       if (String(frame.channel || '').includes('.v2')) console.log(`Kick chat connected (${this.slug})`)
       return
     }
@@ -502,6 +663,7 @@ export class KickChat {
 
   private scheduleReconnect() {
     if (this.closed || this.reconnectTimer) return
+    this.hasFailed = true
     const delay = Math.min(15_000, 1_000 * 2 ** this.attempt++)
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined
@@ -514,12 +676,6 @@ export class KickChat {
     this.pingTimer = undefined
     const socket = this.ws
     this.ws = undefined
-    if (!socket) return
-    await new Promise<void>((resolve) => {
-      socket.once('close', () => resolve())
-      socket.once('error', () => resolve())
-      try { socket.close() } catch { resolve() }
-      setTimeout(resolve, 500)
-    })
+    dropSocket(socket)
   }
 }

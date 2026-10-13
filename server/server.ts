@@ -9,7 +9,7 @@ import express from 'express'
 import cors from 'cors'
 import WebSocket from 'ws'
 import { createServer } from 'node:http'
-import { KickChat, lookupKickProfilePics, type KickActivity, type KickModeration } from './kick-chat.js'
+import { KickChat, createFlushLock, lookupKickProfilePics, type KickActivity, type KickModeration } from './kick-chat.js'
 import { YouTubeLiveChat, youtubeViewersWhileLive, type YouTubeChatMessage, type YouTubeChatTarget, type YouTubeModeration } from './youtube-chat.js'
 import { ACTIVITY_MAX_AGE_MS, createActivityStore, kickProfileSlug, type ActivityEvent } from './activity.js'
 import { looksLikeJwt, resolveEnvFilePath, resolveEnvTemplatePath, setEnvKey, STREAMELEMENTS_JWT_KEYS, syncEnvFile, writeTextAtomic } from './env-file.js'
@@ -50,7 +50,7 @@ import {
   kickStreamDetails,
   normalizeTags,
   twitchTagsForApi,
-  kickTagsForApi,
+  kickChannelPatch,
   looksLikePlaceholder,
   mergeIncomingChat,
   missingStreamElementsMessage,
@@ -81,6 +81,7 @@ import {
   sseChangedKeys,
   sseNamedEvent,
   shouldKeepTokenRefreshBanner,
+  shouldWarnKickChatDown,
   summarizeApiError,
   syncYouTubeTokenChatIds,
   tokenRefreshFailureMessage,
@@ -98,7 +99,9 @@ import {
   youtubeApiErrorReason,
   youtubeBadges,
   youtubeChatLabel,
+  loadYoutubeBanIds,
   youtubeBanChatIds,
+  youtubeBanRecord,
   youtubeLiveChatBanSnippet,
   youtubeLiveChatCursor,
   youtubeLiveChatListQuery,
@@ -314,6 +317,7 @@ let twitchAvatarTimer: NodeJS.Timeout | undefined
 const kickAvatars = new Map<string, string>()
 const kickAvatarPending = new Set<string>()
 let kickAvatarTimer: NodeJS.Timeout | undefined
+const kickAvatarFlush = createFlushLock()
 const refreshLocks = new Map<Platform, Promise<Token | undefined>>()
 const kickChat = new KickChat()
 const youtubeChat = new YouTubeLiveChat()
@@ -1711,7 +1715,7 @@ function refreshChatHealth() {
     const kickAccount = state.accounts.find((item) => item.platform === 'Kick')
     if (!shouldKeepTokenRefreshBanner(state.health.Kick, Boolean(kickAccount?.connected))) {
       if (kickChat.connected) { if (state.health.Kick.status === 'down') setHealth('Kick', 'ok') }
-      else setHealth('Kick', 'down', 'Kick chat disconnected — messages may be missing')
+      else if (shouldWarnKickChatDown(kickChat.connected, kickChat.failed)) setHealth('Kick', 'down', 'Kick chat disconnected — messages may be missing')
     }
   } else if (isTokenRefreshHealthMessage(state.health.Kick.message)) {
     setHealth('Kick', 'ok')
@@ -1859,27 +1863,29 @@ function queueKickAvatar(slug?: string) {
 }
 
 async function flushKickAvatars() {
-  const slugs = [...kickAvatarPending].slice(0, 5)
-  slugs.forEach((slug) => kickAvatarPending.delete(slug))
-  if (!slugs.length) return
-  const pics = await lookupKickProfilePics(slugs)
-  for (const [slug, url] of pics) {
-    const avatar = normalizeAvatar(url)
-    if (avatar) kickAvatars.set(slug, avatar)
-  }
-  let changed = false
-  state.messages = state.messages.map((item) => {
-    if (item.platform !== 'Kick') return item
-    const avatar = kickAvatars.get((item.handle || kickProfileSlug(item.user)).toLowerCase())
-    if (!avatar || item.avatar === avatar) return item
-    changed = true
-    return { ...item, avatar }
+  await kickAvatarFlush.run(async () => {
+    const slugs = [...kickAvatarPending].slice(0, 5)
+    slugs.forEach((slug) => kickAvatarPending.delete(slug))
+    if (!slugs.length) return
+    const pics = await lookupKickProfilePics(slugs)
+    for (const [slug, url] of pics) {
+      const avatar = normalizeAvatar(url)
+      if (avatar) kickAvatars.set(slug, avatar)
+    }
+    let changed = false
+    state.messages = state.messages.map((item) => {
+      if (item.platform !== 'Kick') return item
+      const avatar = kickAvatars.get((item.handle || kickProfileSlug(item.user)).toLowerCase())
+      if (!avatar || item.avatar === avatar) return item
+      changed = true
+      return { ...item, avatar }
+    })
+    if (changed) {
+      scheduleChatSave()
+      broadcast()
+    }
+    if (kickAvatarPending.size) queueKickAvatar([...kickAvatarPending][0])
   })
-  if (changed) {
-    scheduleChatSave()
-    broadcast()
-  }
-  if (kickAvatarPending.size) queueKickAvatar([...kickAvatarPending][0])
 }
 
 function rememberOutgoing(entry: { id: string; text: string; platforms: Platform[]; at: number }) {
@@ -2217,11 +2223,11 @@ async function pollLiveState() {
   }
   if (tokens.Kick) {
     if (shouldPollLiveStatus(settings.autoLiveCheck.Kick, 'auto')) {
-      try { await pollKick(); logPolledLive('Kick'); if (kickChat.connected) setHealth('Kick', 'ok'); else if (tokens.Kick) setHealth('Kick', 'down', 'Kick chat disconnected — messages may be missing') } catch (error) {
+      try { await pollKick(); logPolledLive('Kick'); if (kickChat.connected) setHealth('Kick', 'ok'); else if (shouldWarnKickChatDown(kickChat.connected, kickChat.failed)) setHealth('Kick', 'down', 'Kick chat disconnected — messages may be missing') } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         console.error('Kick poll:', message)
-        if (!kickChat.connected) setHealth('Kick', 'down', 'Kick poll failed — messages may be missing')
-        else setHealth('Kick', 'warn', 'Kick status poll failed')
+        if (kickChat.connected) setHealth('Kick', 'warn', 'Kick status poll failed')
+        else setHealth('Kick', 'down', 'Kick poll failed — messages may be missing')
       }
     } else maintainKickChat()
   }
@@ -2800,8 +2806,11 @@ async function moderateKick(body: { action: string; messageId?: string; userId?:
   return { ok: true, ...(body.action !== 'unban' && payload.reason ? { reason: payload.reason } : {}) }
 }
 
-// Remember the ban ids YouTube handed back so the dock can unban what it banned (YouTube unban needs the original ban id)
-const youtubeBanIds = new Map<string, string[]>()
+const youtubeBanFile = path.join(dataDir, 'youtube-bans.json')
+const youtubeBanIds = loadYoutubeBanIds(readJsonFile(youtubeBanFile, {}))
+function saveYoutubeBans() {
+  writeJsonAtomic(youtubeBanFile, youtubeBanRecord(youtubeBanIds))
+}
 
 /** Sending via the official YouTube Data API: delete a message, unban by the ban id we stored, or ban/timeout across every live chat we have. */
 async function moderateYouTube(body: { action: string; messageId?: string; userId?: string; sourceId?: string; duration?: number }) {
@@ -2820,7 +2829,10 @@ async function moderateYouTube(body: { action: string; messageId?: string; userI
     if (!ids.length) return { ok: false, error: 'Unban this chatter on YouTube. Relay only has a ban id after banning from this dock.' }
     const results = await Promise.all(ids.map((id) => youtubeRequest(`/liveChat/bans?id=${encodeURIComponent(id)}`, token, { method: 'DELETE' })))
     const failed = results.filter((result) => !result.ok)
-    if (!failed.length) youtubeBanIds.delete(body.userId.toLowerCase())
+    if (!failed.length) {
+      youtubeBanIds.delete(body.userId.toLowerCase())
+      saveYoutubeBans()
+    }
     return { ok: results.some((result) => result.ok), error: failed.length ? failed.map((result) => youtubeApiErrorReason(result.text)).join(' | ') : undefined }
   }
   const chatIds = youtubeBanChatIds(body.sourceId, youtubeTargets, token)
@@ -2840,7 +2852,10 @@ async function moderateYouTube(body: { action: string; messageId?: string; userI
       if (id) remembered.push(String(id))
     } catch { /* ignore */ }
   }
-  if (remembered.length) youtubeBanIds.set(userId.toLowerCase(), remembered)
+  if (remembered.length) {
+    youtubeBanIds.set(userId.toLowerCase(), remembered)
+    saveYoutubeBans()
+  }
   return { ok: results.some((result) => result.ok), error: failed.length ? failed.map((result) => result.text).join(' | ') : undefined }
 }
 
@@ -2895,10 +2910,11 @@ async function updateStreamInfo(platform: StreamPlatform, info: StreamDetails) {
     }
   }
   if (platform === 'Kick') {
-    const tags = kickTagsForApi(info.tags)
+    const patch = kickChannelPatch({ title: info.title, category: info.category, categoryId: info.categoryId, tags: info.tags })
     try {
-      const response = await kickApi('/channels', undefined, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stream_title: info.title, ...(info.categoryId ? { category_id: Number(info.categoryId) } : {}), ...(tags ? { custom_tags: tags } : {}) }) })
-      return { platform, ok: response.ok, error: response.ok ? undefined : await response.text() }
+      const response = await kickApi('/channels', undefined, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch.body) })
+      if (!response.ok) return { platform, ok: false, error: await response.text() }
+      return { platform, ok: true, ...(patch.warning ? { warning: patch.warning } : {}) }
     } catch (error) {
       return { platform, ok: false, error: error instanceof Error ? error.message : String(error) }
     }

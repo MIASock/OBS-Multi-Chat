@@ -29,6 +29,37 @@ export function kickProfileSlug(user: string, slug?: string) {
   return String(user || '').replace(/^@+/, '').trim().toLowerCase().replace(/_/g, '-')
 }
 
+export function exactCategoryMatch<T extends { id: string; name: string }>(query: string, options: T[]) {
+  const lower = query.trim().toLowerCase()
+  if (!lower) return
+  return options.find((option) => option.name.trim().toLowerCase() === lower)
+}
+
+export function commitTypedCategory<T extends { category: string; categoryId?: string }>(current: T, query: string): T {
+  const text = query.trim()
+  if (current.category.trim().toLowerCase() === text.toLowerCase() && current.categoryId) return { ...current, category: text }
+  const next = { ...current, category: text }
+  delete next.categoryId
+  return next
+}
+
+export function applyExactCategory<T extends { category: string; categoryId?: string }>(current: T, match?: { id: string; name: string }): T {
+  if (!match) return current
+  if (match.name.trim().toLowerCase() !== current.category.trim().toLowerCase()) return current
+  return { ...current, category: match.name, categoryId: match.id }
+}
+
+export function categoryPickNote(name: string, twitchId?: string, kickId?: string) {
+  if (twitchId && kickId) return ''
+  if (twitchId) return `${name} is Twitch only. Kick was not changed.`
+  if (kickId) return `${name} is Kick only. Twitch was not changed.`
+  return ''
+}
+
+export function streamTitleTip(title: string, twitchGame?: string, kickGame?: string) {
+  return ['Opens YouTube Studio', title, twitchGame && `Twitch: ${twitchGame}`, kickGame && `Kick: ${kickGame}`].filter(Boolean).join('\n')
+}
+
 export function preferredCategory(twitch: string, kick: string) {
   const twitchName = twitch.trim()
   const kickName = kick.trim()
@@ -218,6 +249,14 @@ export function profileLinkTitle(platform: string) {
 /** Twitch and Kick accept a ban/timeout reason. YouTube liveChat/bans does not. */
 export function moderationAcceptsReason(platform: string) {
   return platform === 'Twitch' || platform === 'Kick'
+}
+
+export function moderationNeedsDockConfirm(action: string, platforms: string[], reason: string | undefined) {
+  return action === 'ban' && reason === undefined && platforms.length > 0 && platforms.every((platform) => !moderationAcceptsReason(platform))
+}
+
+export function youtubeBanConfirmLabel(user: string, platformLabel: string) {
+  return `Ban ${user} on ${platformLabel}?`
 }
 
 /** Dock status line after a moderation call. Includes the reason only when one was sent. */
