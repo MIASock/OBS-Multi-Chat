@@ -4,6 +4,7 @@ import { fetchTimed } from './fetch-timed.js'
 import {
   TWITCH_EVENTSUB_DEFAULT_URL,
   applyLiveStreamDetails,
+  gigantifyLastEmote,
   normalizeAvatar,
   normalizeTags,
   parseTwitchChatLine,
@@ -33,7 +34,8 @@ export type TwitchLiveDeps = {
   setActivityWarning: (key: string, message?: string) => void
   setChatWarning: (key: string, message?: string) => void
   addMessage: (message: ChatMessage, options?: { preload?: boolean; ingest?: 'official' | 'innertube'; source?: string }) => void
-  addNativeActivity: (event: ActivityEvent) => void
+  /** `always` skips the native-backup setting, for alerts StreamElements does not send. */
+  addNativeActivity: (event: ActivityEvent, options?: { always?: boolean }) => void
   applyChatModerationToState: (change: ChatModeration) => boolean
   restorePlatformConnection: (platform: Platform) => void
   scheduleChatSave: () => void
@@ -209,7 +211,7 @@ export function createTwitchLive(d: TwitchLiveDeps) {
     socket.on('error', (error) => { console.error('Twitch EventSub:', error.message); socket.close() })
   }
 
-  const twitchEventSubs: { type: string; version: string; condition: (userId: string) => Record<string, string>; activity?: boolean }[] = [
+  const twitchEventSubs: { type: string; version: string; condition: (userId: string) => Record<string, string>; activity?: boolean; always?: boolean }[] = [
     { type: 'channel.chat.message', version: '1', condition: (userId) => ({ broadcaster_user_id: userId, user_id: userId }) },
     { type: 'channel.chat.message_delete', version: '1', condition: (userId) => ({ broadcaster_user_id: userId, user_id: userId }) },
     { type: 'channel.chat.clear_user_messages', version: '1', condition: (userId) => ({ broadcaster_user_id: userId, user_id: userId }) },
@@ -219,6 +221,8 @@ export function createTwitchLive(d: TwitchLiveDeps) {
     { type: 'channel.subscription.gift', version: '1', condition: (userId) => ({ broadcaster_user_id: userId }), activity: true },
     { type: 'channel.subscription.message', version: '1', condition: (userId) => ({ broadcaster_user_id: userId }), activity: true },
     { type: 'channel.cheer', version: '1', condition: (userId) => ({ broadcaster_user_id: userId }), activity: true },
+    // Power-ups (gigantify, message effects, celebrations) spend Bits without a `channel.cheer`.
+    { type: 'channel.bits.use', version: '1', condition: (userId) => ({ broadcaster_user_id: userId }), activity: true, always: true },
     { type: 'channel.raid', version: '1', condition: (userId) => ({ to_broadcaster_user_id: userId }), activity: true },
   ]
 
@@ -230,7 +234,7 @@ export function createTwitchLive(d: TwitchLiveDeps) {
     let activityFailed = false
     let moderationFailed = false
     for (const spec of twitchEventSubs) {
-      if (spec.activity && !settings.activityFallback) continue
+      if (spec.activity && !spec.always && !settings.activityFallback) continue
       try {
         await twitchApi('/helix/eventsub/subscriptions', token, {
           method: 'POST',
@@ -279,6 +283,7 @@ export function createTwitchLive(d: TwitchLiveDeps) {
     const type = String(payload?.metadata?.subscription_type || '')
     const event = payload?.payload?.event
     if (type === 'channel.chat.message') {
+      const parts = partsFromTwitchFragments(event?.message?.fragments, event?.message?.text || '')
       addMessage({
         id: event?.message_id || crypto.randomUUID(),
         platform: 'Twitch',
@@ -290,7 +295,7 @@ export function createTwitchLive(d: TwitchLiveDeps) {
         avatar: normalizeAvatar(twitchAvatars.get(String(event?.chatter_user_id || ''))),
         text: event?.message?.text || '',
         time: new Date().toISOString(),
-        parts: partsFromTwitchFragments(event?.message?.fragments, event?.message?.text || ''),
+        parts: event?.message_type === 'power_ups_gigantified_emote' ? gigantifyLastEmote(parts) : parts,
         emotes: (event?.message?.fragments || []).filter((item: any) => item.type === 'emote').map((item: any) => item.emote?.id).filter(Boolean),
       }, { source: 'EventSub' })
       setHealth('Twitch', 'ok')
@@ -308,8 +313,8 @@ export function createTwitchLive(d: TwitchLiveDeps) {
       applyChatModerationToState({ action: 'unban', platform: 'Twitch', userId: event?.user_id ? String(event.user_id) : undefined, user: event?.user_name || event?.user_login })
       return
     }
-    const activity = twitchEventToActivity(type, event, payload?.metadata?.message_timestamp || new Date().toISOString())
-    if (activity) addNativeActivity(activity)
+    const activity = twitchEventToActivity(type, event, payload?.metadata?.message_timestamp || new Date().toISOString(), payload?.metadata?.message_id)
+    if (activity) addNativeActivity(activity, { always: Boolean(activity.powerUp) })
   }
 
   function watchTwitchEventSub() {

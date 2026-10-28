@@ -3,7 +3,7 @@
  */
 
 import crypto from 'node:crypto'
-import type { ActivityEvent } from '../activity.js'
+import type { ActivityEvent, ActivityPowerUp } from '../activity.js'
 import type { ChatBadge, ChatMessage, ChatModeration, MessagePart } from '../types.js'
 
 export function twitchBadgeLabel(set: string) {
@@ -58,8 +58,24 @@ export function twitchBadgesFromList(badges?: { set_id?: string; id?: string }[]
 }
 
 
-export function twitchEmoteUrl(id: string) {
-  return `https://static-cdn.jtvnw.net/emoticons/v2/${encodeURIComponent(id)}/default/dark/2.0`
+export function twitchEmoteUrl(id: string, scale: '2.0' | '3.0' = '2.0') {
+  return `https://static-cdn.jtvnw.net/emoticons/v2/${encodeURIComponent(id)}/default/dark/${scale}`
+}
+
+/**
+ * The Gigantify an Emote Power-up always enlarges the last emote in the
+ * message. Mark that one `big` and switch it to Twitch's largest scale so it
+ * stays sharp at the larger size.
+ */
+export function gigantifyLastEmote(parts: MessagePart[]): MessagePart[] {
+  for (let index = parts.length - 1; index >= 0; index--) {
+    const part = parts[index]
+    if (part.type !== 'emote') continue
+    const next = [...parts]
+    next[index] = { ...part, big: true, url: part.url.replace(/\/default\/dark\/2\.0$/, '/default/dark/3.0') }
+    return next
+  }
+  return parts
 }
 
 
@@ -104,6 +120,7 @@ export function parseTwitchChatLine(line: string, options: { now?: Date; urls?: 
   if (!match) return
   const tags = parseIrcTags(match[1] || '')
   const userId = tags['user-id'] || undefined
+  const parts = parseTwitchEmoteParts(match[3], tags.emotes)
   return {
     id: tags.id || crypto.randomUUID(),
     platform: 'Twitch',
@@ -114,7 +131,7 @@ export function parseTwitchChatLine(line: string, options: { now?: Date; urls?: 
     badges: twitchBadgesFromTag(tags.badges, options.urls),
     text: match[3],
     time: (options.now || new Date()).toISOString(),
-    parts: parseTwitchEmoteParts(match[3], tags.emotes),
+    parts: tags['msg-id'] === 'gigantified-emote-message' ? gigantifyLastEmote(parts) : parts,
     emotes: tags.emotes ? tags.emotes.split('/').map((item: string) => item.split(':')[0]) : [],
   }
 }
@@ -147,7 +164,14 @@ export function sanitizeIrcMessage(text: string) {
 }
 
 
-export function twitchEventToActivity(type: string, event: any, now = new Date().toISOString()): ActivityEvent | undefined {
+const TWITCH_POWER_UPS: Record<string, ActivityPowerUp> = {
+  gigantify_an_emote: 'gigantify',
+  message_effect: 'message-effect',
+  celebration: 'celebration',
+}
+
+/** `messageId` is the EventSub notification id, so a redelivered notification collapses to one row. */
+export function twitchEventToActivity(type: string, event: any, now = new Date().toISOString(), messageId?: string): ActivityEvent | undefined {
   const time = now
   if (type === 'channel.follow') {
     return { id: `twitch-follow-${event?.user_id}-${event?.followed_at || time}`, platform: 'Twitch', kind: 'follow', user: event?.user_login || event?.user_name || 'Twitch user', userId: event?.user_id ? String(event.user_id) : undefined, time: event?.followed_at || time }
@@ -179,6 +203,30 @@ export function twitchEventToActivity(type: string, event: any, now = new Date()
     const bits = Number(event?.bits)
     const user = event?.is_anonymous ? 'Anonymous' : event?.user_name || event?.user_login || 'Twitch user'
     return { id: `twitch-cheer-${event?.user_id || 'anon'}-${time}`, platform: 'Twitch', kind: 'cheer', user, userId: event?.user_id ? String(event.user_id) : undefined, amount: Number.isFinite(bits) ? `${bits} Bits` : undefined, message: String(event?.message || '').trim() || undefined, time }
+  }
+  if (type === 'channel.bits.use') {
+    // Plain cheers also arrive here, but `channel.cheer` already covers them. Everything else
+    // is a Power-up: built-in (`power_up`), streamer-made (`custom_power_up`), or a type
+    // Twitch adds later, which still shows as a generic Power-up instead of being dropped.
+    if (event?.type === 'cheer') return
+    const bits = Number(event?.bits)
+    if (!Number.isFinite(bits) || bits <= 0) return
+    const custom = event?.type === 'custom_power_up'
+    const powerUp: ActivityPowerUp = custom ? 'custom' : TWITCH_POWER_UPS[String(event?.power_up?.type || '')] || 'other'
+    const emote = String(event?.power_up?.emote?.name || '').trim()
+    const text = String(event?.message?.text || '').trim()
+    const title = String(event?.custom_power_up?.title || '').trim()
+    return {
+      id: messageId ? `twitch-bits-${messageId}` : `twitch-powerup-${event?.user_id || 'anon'}-${time}`,
+      platform: 'Twitch',
+      kind: 'cheer',
+      powerUp,
+      user: event?.user_name || event?.user_login || 'Twitch user',
+      userId: event?.user_id ? String(event.user_id) : undefined,
+      amount: `${bits} Bits`,
+      message: (powerUp === 'gigantify' ? emote : custom ? [title, text].filter(Boolean).join(' · ') : text || emote) || undefined,
+      time,
+    }
   }
   if (type === 'channel.raid') {
     const viewers = Number(event?.viewers)
