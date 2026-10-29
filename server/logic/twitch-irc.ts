@@ -3,7 +3,7 @@
  */
 
 import crypto from 'node:crypto'
-import type { ActivityEvent, ActivityPowerUp } from '../activity.js'
+import { normalizeSubTier, type ActivityEvent, type ActivityPowerUp } from '../activity.js'
 import type { ChatBadge, ChatMessage, ChatModeration, MessagePart } from '../types.js'
 
 export function twitchBadgeLabel(set: string) {
@@ -179,7 +179,7 @@ export function twitchEventToActivity(type: string, event: any, now = new Date()
   if (type === 'channel.subscribe') {
     // Gifted subs arrive via `channel.subscription.gift` instead; skip so they aren't double-counted.
     if (event?.is_gift) return
-    return { id: `twitch-sub-${event?.user_id}-${time}`, platform: 'Twitch', kind: 'subscription', user: event?.user_login || event?.user_name || 'Twitch user', userId: event?.user_id ? String(event.user_id) : undefined, time }
+    return { id: `twitch-sub-${event?.user_id}-${time}`, platform: 'Twitch', kind: 'subscription', user: event?.user_login || event?.user_name || 'Twitch user', userId: event?.user_id ? String(event.user_id) : undefined, tier: normalizeSubTier(event?.tier), time }
   }
   if (type === 'channel.subscription.message') {
     const months = Number(event?.cumulative_months || event?.duration_months)
@@ -191,13 +191,51 @@ export function twitchEventToActivity(type: string, event: any, now = new Date()
       userId: event?.user_id ? String(event.user_id) : undefined,
       months: Number.isFinite(months) && months > 0 ? months : undefined,
       message: String(event?.message?.text || '').trim() || undefined,
+      tier: normalizeSubTier(event?.tier),
+      time,
+    }
+  }
+  if (type === 'channel.chat.notification') {
+    // Sub and resub notices say whether the plan was Prime. A sub_gift notice is the only
+    // native event that names both the recipient and the gifter. Other notice types
+    // (community gifts, raids, ...) already arrive on their own EventSub topics.
+    const notice = String(event?.notice_type || '')
+    if (notice === 'sub_gift') {
+      const gift = event?.sub_gift || {}
+      const recipient = String(gift.recipient_user_login || gift.recipient_user_name || '').trim()
+      if (!recipient) return
+      return {
+        id: messageId ? `twitch-notice-${messageId}` : `twitch-sub_gift-${gift.recipient_user_id}-${time}`,
+        platform: 'Twitch',
+        feed: 'twitch-notice',
+        kind: 'subscription',
+        user: recipient,
+        userId: gift.recipient_user_id ? String(gift.recipient_user_id) : undefined,
+        tier: normalizeSubTier(gift.sub_tier),
+        giftedBy: event?.chatter_is_anonymous ? 'Anonymous' : String(event?.chatter_user_name || event?.chatter_user_login || '').trim() || 'Anonymous',
+        time,
+      }
+    }
+    if (notice !== 'sub' && notice !== 'resub') return
+    const detail = event?.[notice] || {}
+    const months = Number(detail.cumulative_months || detail.duration_months)
+    return {
+      id: messageId ? `twitch-notice-${messageId}` : `twitch-${notice}-${event?.chatter_user_id}-${time}`,
+      platform: 'Twitch',
+      feed: 'twitch-notice',
+      kind: 'subscription',
+      user: event?.chatter_user_login || event?.chatter_user_name || 'Twitch user',
+      userId: event?.chatter_user_id ? String(event.chatter_user_id) : undefined,
+      months: notice === 'resub' && Number.isFinite(months) && months > 0 ? months : undefined,
+      message: String(event?.message?.text || '').trim() || undefined,
+      tier: detail.is_prime ? 'prime' : normalizeSubTier(detail.sub_tier),
       time,
     }
   }
   if (type === 'channel.subscription.gift') {
     const total = Number(event?.total)
     const user = event?.is_anonymous ? 'Anonymous' : event?.user_name || event?.user_login || 'Twitch user'
-    return { id: `twitch-gift-${event?.user_id || 'anon'}-${time}`, platform: 'Twitch', kind: 'gift', user, userId: event?.user_id ? String(event.user_id) : undefined, amount: Number.isFinite(total) && total > 0 ? `${total} gift${total === 1 ? '' : 's'}` : undefined, time }
+    return { id: `twitch-gift-${event?.user_id || 'anon'}-${time}`, platform: 'Twitch', kind: 'gift', user, userId: event?.user_id ? String(event.user_id) : undefined, amount: Number.isFinite(total) && total > 0 ? `${total} gift${total === 1 ? '' : 's'}` : undefined, tier: normalizeSubTier(event?.tier), time }
   }
   if (type === 'channel.cheer') {
     const bits = Number(event?.bits)

@@ -1,7 +1,7 @@
 import { useEffect, useState, type MouseEvent } from 'react'
 import { Bell, DollarSign, Gift, Heart, ShoppingBag, Swords, Twitch, UserPlus, X, Youtube, Zap } from 'lucide-react'
 import { chatProfileUrl, openDockUrl, profileLinkTitle } from '../chat-helpers'
-import { activityKindLabel, activitySubtitle } from './format'
+import { activityKindLabel, activityPlanColor, activityPlanLabel, activitySubtitle, pillTextColor } from './format'
 
 /**
  * One activity row for the dock: platform and kind icons, user, subtitle,
@@ -11,7 +11,8 @@ import { activityKindLabel, activitySubtitle } from './format'
 export type ActivityPlatform = 'Twitch' | 'Kick' | 'YouTube' | 'StreamElements'
 export type ActivityKind = 'follow' | 'subscription' | 'gift' | 'cheer' | 'raid' | 'donation' | 'membership' | 'superchat' | 'merch'
 export type ActivityPowerUp = 'gigantify' | 'message-effect' | 'celebration' | 'custom' | 'other'
-export type ActivityFeed = 'native' | 'streamelements'
+export type ActivityFeed = 'native' | 'streamelements' | 'twitch-notice'
+export type ActivitySubTier = 'prime' | '1000' | '2000' | '3000'
 export type ActivityEvent = {
   id: string
   platform: ActivityPlatform
@@ -28,6 +29,8 @@ export type ActivityEvent = {
   source?: ActivityPlatform
   powerUp?: ActivityPowerUp
   feed?: ActivityFeed
+  tier?: ActivitySubTier
+  giftedBy?: string
 }
 
 export const platformColor: Record<ActivityPlatform, string> = {
@@ -39,6 +42,8 @@ export const platformColor: Record<ActivityPlatform, string> = {
 
 export function kindColor(event: ActivityEvent) {
   if (event.kind === 'follow') return platformColor[event.platform]
+  // Twitch subs and gift subs wear Twitch purple; other platforms' subs, gifts, and members stay red.
+  if ((event.kind === 'subscription' || event.kind === 'gift') && event.platform === 'Twitch') return platformColor.Twitch
   if (event.kind === 'subscription' || event.kind === 'membership' || event.kind === 'gift') return '#ff4d57'
   if (event.kind === 'donation' || event.kind === 'merch') return '#f3af61'
   if (event.kind === 'raid') return '#f3af61'
@@ -74,11 +79,13 @@ export function profileHref(event: ActivityEvent, channelLogin?: string) {
   return chatProfileUrl({ platform: source, user: event.user, userId: event.userId, handle: event.handle }, channelLogin) || event.profileUrl
 }
 
-export function ActivityRow({ event, age, channelLogin, openIn = 'dock', onDelete }: { event: ActivityEvent; age: string; channelLogin?: string; openIn?: 'dock' | 'browser'; onDelete?: (id: string) => void }) {
+export function ActivityRow({ event, age, channelLogin, openIn = 'dock', nested = false, onDelete }: { event: ActivityEvent; age: string; channelLogin?: string; openIn?: 'dock' | 'browser'; nested?: boolean; onDelete?: (id: string) => void }) {
   const source = event.source || event.platform
   const color = platformColor[event.platform]
   const badge = kindColor(event)
-  const detail = activitySubtitle(event)
+  // Under its gift row the gifter is already shown, so the line skips it.
+  const detail = activitySubtitle(nested ? { ...event, giftedBy: undefined } : event)
+  const plan = activityPlanLabel(event)
   const href = profileHref(event, source === 'Twitch' ? channelLogin : undefined)
   const [armed, setArmed] = useState(false)
   useEffect(() => {
@@ -95,7 +102,7 @@ export function ActivityRow({ event, age, channelLogin, openIn = 'dock', onDelet
     click.preventDefault()
     setArmed((current) => !current)
   }
-  const className = href ? 'activity-row activity-row-link' : 'activity-row'
+  const className = [href ? 'activity-row activity-row-link' : 'activity-row', nested && !onDelete ? 'activity-nested' : ''].filter(Boolean).join(' ')
   const style = { ['--row-color' as string]: color }
   const title = href ? profileLinkTitle(source) : undefined
   const body = (
@@ -106,7 +113,8 @@ export function ActivityRow({ event, age, channelLogin, openIn = 'dock', onDelet
         <strong>{event.user}</strong>
         {detail ? <small>{detail}</small> : null}
       </div>
-      <span className="activity-kind" style={{ background: badge, color: '#fff' }}>{activityKindLabel(event)}</span>
+      {plan ? <span className="activity-plan" style={{ color: activityPlanColor(event.tier) }}>{plan}</span> : null}
+      <span className="activity-kind" style={{ background: badge, color: pillTextColor(badge) }}>{activityKindLabel(event)}</span>
       <time className="activity-age">{age}</time>
     </>
   )
@@ -115,7 +123,7 @@ export function ActivityRow({ event, age, channelLogin, openIn = 'dock', onDelet
     : <button type="button" className={className} style={style} title={title} onClick={href ? openProfile : undefined}>{body}</button>
   if (!onDelete) return row
   return (
-    <div className={armed ? 'activity-row-wrap armed' : 'activity-row-wrap'} onContextMenu={revealDelete}>
+    <div className={['activity-row-wrap', armed ? 'armed' : '', nested ? 'activity-nested' : ''].filter(Boolean).join(' ')} onContextMenu={revealDelete}>
       {row}
       <button type="button" className="activity-delete" aria-label={`Delete ${event.user}`} title="Delete alert" onClick={(click) => { click.stopPropagation(); onDelete(event.id) }}>
         <X size={14} />

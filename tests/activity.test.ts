@@ -5,12 +5,12 @@ import path from 'node:path'
 import { describe, it, type TestContext } from 'node:test'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { activityIsDuplicate, createActivityStore, parseActivityTime, profileUrl } from '../server/activity.js'
+import { activityIsDuplicate, createActivityStore, normalizeSubTier, parseActivityTime, profileUrl } from '../server/activity.js'
 import { missingStreamElementsMessage, twitchEventToActivity } from '../server/logic.js'
-import { activityFromStreamElements, postStreamElementsMock, streamElementsEmulatePlan, streamElementsMockActivity, streamElementsMockActivityUrl, StreamElementsClient } from '../server/streamelements.js'
+import { activityFromStreamElements, postStreamElementsMock, STREAMELEMENTS_HISTORY_TYPES, STREAMELEMENTS_REPAIR_TYPES, streamElementsEmulatePlan, streamElementsHistoryUrl, streamElementsMockActivity, streamElementsMockActivityUrl, StreamElementsClient } from '../server/streamelements.js'
 import { ActivityWarningBanner, activityWarningKey, shouldShowActivityWarning } from '../src/activity/ActivityApp.tsx'
-import { profileHref } from '../src/activity/ActivityRow.tsx'
-import { activityKindLabel, activitySubtitle, kindLabel } from '../src/activity/format.ts'
+import { kindColor, platformColor, profileHref } from '../src/activity/ActivityRow.tsx'
+import { activityKindLabel, activityListRows, activityPlanColor, activityPlanLabel, activitySubtitle, GIFT_GROUP_MS, kindLabel, pillTextColor } from '../src/activity/format.ts'
 
 describe('activity time and profiles', () => {
   it('parses unix seconds, millis, ISO, and $date wrappers', () => {
@@ -95,6 +95,27 @@ describe('activity store', () => {
       assert.equal(activityIsDuplicate(gigantify, { ...gigantify }), true)
     } finally {
       try { fs.unlinkSync(file) } catch { /* ignore */ }
+    }
+  })
+
+  it('folds a Twitch sub notice into the channel.subscribe row and keeps its Prime plan', () => {
+    const file = path.join(os.tmpdir(), `relay-activity-notice-${Date.now()}-${Math.random().toString(16).slice(2)}.json`)
+    try {
+      const store = createActivityStore(file)
+      const now = '2026-09-02T12:00:00.000Z'
+      const subscribe = { ...twitchEventToActivity('channel.subscribe', { user_login: 'ada', user_id: '7', tier: '1000' }, now)!, feed: 'native' as const }
+      const notice = { ...twitchEventToActivity('channel.chat.notification', { notice_type: 'sub', chatter_user_id: '7', chatter_user_login: 'ada', sub: { sub_tier: '1000', is_prime: true } }, '2026-09-02T12:00:01.000Z', 'n1')!, feed: 'native' as const }
+      assert.equal(twitchEventToActivity('channel.chat.notification', { notice_type: 'sub', chatter_user_id: '7', sub: {} }, now)?.feed, 'twitch-notice')
+      assert.equal(store.add(subscribe), true)
+      // addNativeActivity keeps a feed the parser already set, so the notice stays on its own wire.
+      assert.equal(store.add({ ...notice, feed: 'twitch-notice' }), 'updated')
+      assert.equal(store.list().length, 1)
+      assert.equal(store.list()[0].tier, 'prime')
+      // A second channel.subscribe for the same person is a second spend and stays its own row.
+      assert.equal(store.add({ ...subscribe, id: 'twitch-sub-7-again', time: '2026-09-02T12:00:30.000Z' }), true)
+    } finally {
+      fs.rmSync(file, { force: true })
+      fs.rmSync(`${file}.bak`, { force: true })
     }
   })
 
@@ -223,7 +244,223 @@ describe('Twitch EventSub activity', () => {
   })
 })
 
+describe('gifted subs', () => {
+  const base = Date.parse('2026-10-11T20:20:00.000Z')
+  const at = (seconds: number) => new Date(base + seconds * 1000).toISOString()
+  const ev = (id: string, kind: string, user: string, seconds: number, extra: Record<string, unknown> = {}) => ({ id, platform: 'Twitch' as string, kind, user, time: at(seconds), ...extra })
+  const newestFirst = <T extends { time: string }>(events: T[]) => [...events].sort((left, right) => Date.parse(right.time) - Date.parse(left.time))
+  const shape = (rows: Array<{ event: { user: string; amount?: string; tier?: string }; nested: boolean; synthetic?: boolean }>) => rows.map((row) => `${row.nested ? '  ' : ''}${row.event.user}${row.synthetic ? '*' : ''}${row.event.amount ? ` ${row.event.amount}` : ''}${row.event.tier ? ` ${row.event.tier}` : ''}`)
+
+  it('reads the gifter from StreamElements and Twitch sub_gift notices', () => {
+    const se = activityFromStreamElements({ type: 'subscriber', provider: 'twitch', _id: 'g1', createdAt: at(0), data: { username: 'vannyventure', displayName: 'VannyVenture', providerId: '80955688', tier: '1000', sender: 'gin1336', gifted: true, amount: 1 } })
+    assert.equal(se?.kind, 'subscription')
+    assert.equal(se?.giftedBy, 'gin1336')
+    assert.equal(se?.tier, '1000')
+    assert.equal(activityFromStreamElements({ type: 'subscriber', provider: 'twitch', _id: 'g2', data: { username: 'ada', tier: 'prime' } })?.giftedBy, undefined)
+    assert.equal(activityFromStreamElements({ type: 'communitygiftpurchase', provider: 'twitch', _id: 'g3', data: { username: 'gin1336', amount: 5, tier: '2000' } })?.tier, '2000')
+
+    const native = twitchEventToActivity('channel.chat.notification', { notice_type: 'sub_gift', chatter_user_name: 'GIN1336', chatter_user_login: 'gin1336', sub_gift: { recipient_user_id: '80955688', recipient_user_login: 'vannyventure', sub_tier: '1000', duration_months: 1 } }, at(0), 'n9')
+    assert.equal(native?.user, 'vannyventure')
+    assert.equal(native?.giftedBy, 'GIN1336')
+    assert.equal(native?.tier, '1000')
+    assert.equal(twitchEventToActivity('channel.chat.notification', { notice_type: 'sub_gift', chatter_is_anonymous: true, sub_gift: { recipient_user_login: 'ada' } }, at(0))?.giftedBy, 'Anonymous')
+    assert.equal(twitchEventToActivity('channel.subscription.gift', { user_name: 'Gin', total: 5, tier: '3000' }, at(0))?.tier, '3000')
+    assert.equal(activitySubtitle({ giftedBy: 'gin1336', months: 1 }), 'Gift from gin1336 · 1 mo')
+  })
+
+  it('nests gifted subs under the matching gift row, oldest first', () => {
+    const events = newestFirst([
+      ev('gift', 'gift', 'GIN1336', 0, { handle: 'gin1336', amount: '2 gifts', tier: '1000' }),
+      ev('r1', 'subscription', 'Ada', 2, { giftedBy: 'gin1336', tier: '1000' }),
+      ev('r2', 'subscription', 'Mel', 1, { giftedBy: 'gin1336', tier: '1000' }),
+      ev('own', 'subscription', 'Pat', 30, { tier: 'prime' }),
+      ev('follow', 'follow', 'Rosa', 60),
+    ])
+    assert.deepEqual(shape(activityListRows(events, true)), ['Rosa', 'Pat prime', 'GIN1336 2 gifts 1000', '  Mel 1000', '  Ada 1000'])
+    assert.deepEqual(shape(activityListRows(events, false)), ['Rosa', 'Pat prime', 'Ada 1000', 'Mel 1000', 'GIN1336 2 gifts 1000'])
+  })
+
+  it('gives a gift row no more subs than it gifted', () => {
+    const events = newestFirst([
+      ev('gift', 'gift', 'gin1336', 0, { amount: '2 gifts' }),
+      ev('a', 'subscription', 'Ada', 1, { giftedBy: 'gin1336' }),
+      ev('b', 'subscription', 'Bea', 2, { giftedBy: 'gin1336' }),
+      ev('c', 'subscription', 'Cal', 40, { giftedBy: 'gin1336' }),
+    ])
+    assert.deepEqual(shape(activityListRows(events, true)), ['gin1336* 1 gift', '  Cal', 'gin1336 2 gifts', '  Ada', '  Bea'])
+  })
+
+  it('makes up a gift row for gifted subs with no gift row, and splits by gifter and time', () => {
+    const later = GIFT_GROUP_MS / 1000 + 60
+    const events = newestFirst([
+      ev('v', 'subscription', 'VannyVenture', 0, { giftedBy: 'gin1336', tier: '1000' }),
+      ev('w', 'subscription', 'Willow', 10, { giftedBy: 'gin1336', tier: '2000' }),
+      ev('x', 'subscription', 'Xan', 5, { giftedBy: 'someoneelse', tier: '1000' }),
+      ev('y', 'subscription', 'Yara', later, { giftedBy: 'gin1336', tier: '1000' }),
+    ])
+    const rows = activityListRows(events, true)
+    assert.deepEqual(shape(rows), ['gin1336* 1 gift 1000', '  Yara 1000', 'gin1336* 2 gifts', '  VannyVenture 1000', '  Willow 2000', 'someoneelse* 1 gift 1000', '  Xan 1000'])
+    assert.equal(rows.filter((row) => row.synthetic).every((row) => row.event.kind === 'gift' && row.event.id.startsWith('gift-group-')), true)
+  })
+
+  it('leaves a gift from another platform or far away in time alone', () => {
+    const events = newestFirst([
+      ev('gift', 'gift', 'gin1336', 0, { amount: '1 gift' }),
+      ev('k', 'subscription', 'KickKid', 1, { giftedBy: 'gin1336', platform: 'Kick' }),
+      ev('far', 'subscription', 'Late', GIFT_GROUP_MS / 1000 + 5, { giftedBy: 'gin1336' }),
+    ])
+    assert.deepEqual(shape(activityListRows(events, true)), ['gin1336* 1 gift', '  Late', 'gin1336* 1 gift', '  KickKid', 'gin1336 1 gift'])
+  })
+
+  it('fills older rows from history without adding rows that are not stored', () => {
+    const file = path.join(os.tmpdir(), `relay-activity-fill-${Date.now()}-${Math.random().toString(16).slice(2)}.json`)
+    try {
+      const store = createActivityStore(file)
+      const stored = { id: '6acbf0327f7cecfdcde49ce8', platform: 'Twitch' as const, kind: 'subscription' as const, user: 'VannyVenture', handle: 'vannyventure', time: at(0) }
+      assert.equal(store.add(stored), true)
+      assert.equal(store.add({ ...stored, giftedBy: 'gin1336', tier: '1000' }, { fillOnly: true }), 'updated')
+      assert.equal(store.list()[0].giftedBy, 'gin1336')
+      assert.equal(store.list()[0].tier, '1000')
+      assert.equal(store.add({ id: 'deleted-long-ago', platform: 'Twitch', kind: 'subscription', user: 'Gone', time: at(10) }, { fillOnly: true }), false)
+      assert.equal(store.list().length, 1)
+    } finally {
+      fs.rmSync(file, { force: true })
+      fs.rmSync(`${file}.bak`, { force: true })
+    }
+  })
+
+  it('asks for a longer window of only subs and gifts when repairing', () => {
+    const url = new URL(streamElementsHistoryUrl('chan', Date.parse('2026-10-28T12:00:00.000Z'), 60, STREAMELEMENTS_REPAIR_TYPES))
+    assert.equal(url.searchParams.get('after'), '2026-08-29T12:00:00.000Z')
+    assert.deepEqual(url.searchParams.getAll('types'), ['subscriber', 'subscription', 'communitygiftpurchase'])
+  })
+
+  it('fills in a gifter missing from the first copy of a gifted sub', () => {
+    const file = path.join(os.tmpdir(), `relay-activity-gift-${Date.now()}-${Math.random().toString(16).slice(2)}.json`)
+    try {
+      const store = createActivityStore(file)
+      const row = { id: 'n1', platform: 'Twitch' as const, kind: 'subscription' as const, user: 'vannyventure', userId: '80955688', time: at(0) }
+      assert.equal(store.add(row), true)
+      assert.equal(store.add({ ...row, id: 'se1', giftedBy: 'gin1336', time: at(3) }), 'updated')
+      assert.equal(store.list()[0].giftedBy, 'gin1336')
+      assert.equal(store.add({ ...row, id: 'se2', giftedBy: 'other', time: at(4) }), false)
+      assert.equal(store.list()[0].giftedBy, 'gin1336')
+    } finally {
+      fs.rmSync(file, { force: true })
+      fs.rmSync(`${file}.bak`, { force: true })
+    }
+  })
+})
+
+describe('activity colors', () => {
+  const at = '2026-09-02T12:00:00.000Z'
+  const event = (platform: 'Twitch' | 'Kick' | 'YouTube', kind: 'subscription' | 'gift' | 'membership' | 'cheer') => ({ id: 'x', platform, kind, user: 'Ada', time: at })
+
+  it('colors Twitch subs and gift subs Twitch purple and leaves other subs red', () => {
+    assert.equal(kindColor(event('Twitch', 'subscription')), platformColor.Twitch)
+    assert.equal(kindColor({ ...event('Twitch', 'subscription'), tier: 'prime' }), platformColor.Twitch)
+    assert.equal(kindColor(event('Twitch', 'gift')), platformColor.Twitch)
+    assert.equal(kindColor(event('Kick', 'subscription')), '#ff4d57')
+    assert.equal(kindColor(event('YouTube', 'membership')), '#ff4d57')
+    assert.equal(kindColor(event('Twitch', 'cheer')), '#00d4ff')
+  })
+})
+
+describe('Twitch sub plans', () => {
+  const now = '2026-09-02T12:00:00.000Z'
+
+  it('normalizes Prime and tier codes from either source', () => {
+    assert.equal(normalizeSubTier('Prime'), 'prime')
+    assert.equal(normalizeSubTier('prime'), 'prime')
+    assert.equal(normalizeSubTier('2000'), '2000')
+    assert.equal(normalizeSubTier(3000), '3000')
+    assert.equal(normalizeSubTier(''), undefined)
+    assert.equal(normalizeSubTier('gold'), undefined)
+  })
+
+  it('reads the plan from StreamElements Twitch subs only', () => {
+    const prime = activityFromStreamElements({ type: 'subscriber', provider: 'twitch', data: { username: 'ada', displayName: 'Ada', tier: 'prime', amount: 1 }, _id: 'p1', createdAt: now })
+    assert.equal(prime?.tier, 'prime')
+    assert.equal(activityKindLabel(prime!), 'SUBSCRIPTION')
+    assert.equal(activityPlanLabel(prime!), 'PRIME')
+    const kick = activityFromStreamElements({ type: 'subscriber', provider: 'kick', data: { username: 'ada', tier: 'prime' }, _id: 'k1', createdAt: now })
+    assert.equal(kick?.tier, undefined)
+    const cheer = activityFromStreamElements({ type: 'cheer', provider: 'twitch', data: { username: 'ada', amount: 100, tier: 'prime' }, _id: 'c1', createdAt: now })
+    assert.equal(cheer?.tier, undefined)
+  })
+
+  it('reads Prime from sub and resub chat notifications and ignores other notices', () => {
+    const sub = twitchEventToActivity('channel.chat.notification', { notice_type: 'sub', chatter_user_id: '7', chatter_user_login: 'ada', chatter_user_name: 'Ada', sub: { sub_tier: '1000', is_prime: true, duration_months: 1 } }, now, 'n1')
+    assert.equal(sub?.kind, 'subscription')
+    assert.equal(sub?.tier, 'prime')
+    assert.equal(sub?.months, undefined)
+    assert.equal(sub?.id, 'twitch-notice-n1')
+    const resub = twitchEventToActivity('channel.chat.notification', { notice_type: 'resub', chatter_user_id: '7', chatter_user_login: 'ada', resub: { sub_tier: '2000', is_prime: false, cumulative_months: 14 }, message: { text: 'still here' } }, now)
+    assert.equal(resub?.tier, '2000')
+    assert.equal(resub?.months, 14)
+    assert.equal(resub?.message, 'still here')
+    assert.equal(twitchEventToActivity('channel.chat.notification', { notice_type: 'raid', raid: { viewer_count: 5 } }, now), undefined)
+    assert.equal(twitchEventToActivity('channel.chat.notification', { notice_type: 'community_sub_gift' }, now), undefined)
+    assert.equal(twitchEventToActivity('channel.subscribe', { user_name: 'Ada', user_id: '7', tier: '3000' }, now)?.tier, '3000')
+  })
+
+  it('keeps SUBSCRIPTION as the pill and puts the plan on its own chip', () => {
+    assert.equal(activityKindLabel({ platform: 'Twitch', kind: 'subscription', tier: 'prime' }), 'SUBSCRIPTION')
+    assert.equal(activityPlanLabel({ kind: 'subscription', tier: 'prime' }), 'PRIME')
+    assert.equal(activityPlanLabel({ kind: 'subscription', tier: '1000' }), 'TIER 1')
+    assert.equal(activityPlanLabel({ kind: 'subscription', tier: '3000' }), 'TIER 3')
+    assert.equal(activityPlanLabel({ kind: 'subscription' }), undefined)
+    assert.equal(activityPlanLabel({ kind: 'gift', tier: '1000' }), 'TIER 1')
+    assert.equal(activityPlanLabel({ kind: 'follow', tier: '1000' }), undefined)
+    assert.notEqual(activityPlanColor('prime'), activityPlanColor('2000'))
+    assert.equal(activitySubtitle({ months: 6 }), '6 mo')
+  })
+
+  it('puts near-black text on the bright pill colors and white on dark ones', () => {
+    for (const color of ['#a970ff', '#ff4d57', '#00d4ff', '#f3af61', '#62c554', '#4aa3ff']) assert.equal(pillTextColor(color), '#0d1013', color)
+    assert.equal(pillTextColor('#202729'), '#fff')
+    assert.equal(pillTextColor('not-a-color'), '#fff')
+  })
+
+  it('lets a later copy that knows Prime upgrade the first copy, and never downgrades it', () => {
+    const file = path.join(os.tmpdir(), `relay-activity-prime-${Date.now()}-${Math.random().toString(16).slice(2)}.json`)
+    try {
+      const store = createActivityStore(file)
+      const native = { id: 'twitch-sub-7', platform: 'Twitch' as const, kind: 'subscription' as const, user: 'ada', userId: '7', tier: '1000' as const, time: now }
+      assert.equal(store.add(native), true)
+      assert.equal(store.add({ ...native, id: 'twitch-notice-n1', tier: 'prime', time: '2026-09-02T12:00:01.000Z' }), 'updated')
+      assert.equal(store.list().length, 1)
+      assert.equal(store.list()[0].tier, 'prime')
+      const saved = JSON.parse(fs.readFileSync(file, 'utf8')) as { tier?: string }[]
+      assert.equal(saved[0].tier, 'prime')
+      assert.equal(store.add({ ...native, id: 'se-1', tier: '1000', time: '2026-09-02T12:00:02.000Z' }), false)
+      assert.equal(store.list()[0].tier, 'prime')
+      assert.equal(store.add({ ...native, id: 'se-2', tier: undefined, time: '2026-09-02T12:00:03.000Z' }), false)
+
+      const fill = { id: 'se-mel', platform: 'Twitch' as const, kind: 'subscription' as const, user: 'Mel', userId: '8', time: now }
+      assert.equal(store.add(fill), true)
+      assert.equal(store.add({ ...fill, id: 'native-mel', tier: '2000' }), 'updated')
+      assert.equal(store.list().find((event) => event.userId === '8')?.tier, '2000')
+    } finally {
+      fs.rmSync(file, { force: true })
+      fs.rmSync(`${file}.bak`, { force: true })
+    }
+  })
+})
+
 describe('StreamElements activity', () => {
+  it('asks for history with types, after, and before, which StreamElements needs to return any rows', () => {
+    const now = Date.parse('2026-10-28T12:00:00.000Z')
+    const url = new URL(streamElementsHistoryUrl('chan id', now))
+    assert.equal(url.pathname, '/kappa/v2/activities/chan%20id')
+    assert.equal(url.searchParams.get('after'), '2026-10-14T12:00:00.000Z')
+    assert.equal(url.searchParams.get('before'), '2026-10-28T12:00:00.000Z')
+    assert.deepEqual(url.searchParams.getAll('types'), [...STREAMELEMENTS_HISTORY_TYPES])
+    for (const type of STREAMELEMENTS_HISTORY_TYPES) {
+      assert.ok(activityFromStreamElements({ type, provider: type === 'kicks' ? 'kick' : 'twitch', data: { username: 'ada', amount: 1 }, _id: type }), type)
+    }
+  })
+
   it('maps tips, follows, cheers, and merch', () => {
     const tip = activityFromStreamElements({ type: 'tip', provider: 'twitch', data: { username: 'Ada', amount: 5, currency: 'USD', message: 'thanks' }, _id: 't1', createdAt: '2026-09-02T12:00:00.000Z' })
     assert.equal(tip?.platform, 'StreamElements')

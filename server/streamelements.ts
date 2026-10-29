@@ -1,6 +1,6 @@
 import crypto from 'node:crypto'
 import WebSocket from 'ws'
-import { parseActivityTime, type ActivityEvent, type ActivityKind, type ActivityPlatform } from './activity.js'
+import { normalizeSubTier, parseActivityTime, type ActivityEvent, type ActivityKind, type ActivityPlatform } from './activity.js'
 
 /**
  * StreamElements feed for the Activity dock: the source of truth for follows,
@@ -142,6 +142,9 @@ export function activityFromStreamElements(payload: any): ActivityEvent | undefi
     userId,
     amount,
     months: kind === 'subscription' || kind === 'membership' ? (Number.isFinite(months) && months > 0 ? months : undefined) : undefined,
+    tier: (kind === 'subscription' || kind === 'gift') && source === 'Twitch' ? normalizeSubTier(inner?.tier) : undefined,
+    // A gifted sub is the recipient's row; `sender` is the gifter's login.
+    giftedBy: kind === 'subscription' && inner?.gifted ? String(inner?.sender || '').replace(/^@+/, '').trim() || 'Anonymous' : undefined,
     viewers: kind === 'raid' && Number.isFinite(viewers) ? viewers : undefined,
     message: String(inner?.message || inner?.comment || root?.donation?.message || '').trim() || undefined,
     time: parseActivityTime(root?.createdAt || inner?.createdAt || payload?.ts),
@@ -266,13 +269,37 @@ export async function hydrateStreamElements(jwt: string): Promise<StreamElements
   return { jwt, channelId, handle, provider: payload?.provider ? String(payload.provider) : undefined }
 }
 
-export async function fetchRecentActivities(channel: StreamElementsChannel): Promise<ActivityEvent[]> {
+/** Every activity type `kindFromSe` maps, so the history covers the same alerts as the live socket. */
+export const STREAMELEMENTS_HISTORY_TYPES = [
+  'follow', 'follower', 'fan', 'subscriber', 'subscription', 'communitygiftpurchase', 'cheer', 'cheerpurchase', 'kicks',
+  'raid', 'host', 'sponsor', 'supporter', 'superchat', 'tip', 'charitycampaigndonation', 'merch', 'purchase', 'redemption',
+] as const
+
+/** Days of StreamElements history the startup backfill adds to the feed. */
+export const STREAMELEMENTS_HISTORY_DAYS = 14
+/**
+ * Days of sub and gift history used only to fill in details (gifter, plan) on
+ * rows already in the feed, such as rows an older build stored without them.
+ */
+export const STREAMELEMENTS_REPAIR_DAYS = 60
+export const STREAMELEMENTS_REPAIR_TYPES = ['subscriber', 'subscription', 'communitygiftpurchase'] as const
+
+/**
+ * Recent activity for the startup backfill. StreamElements answers an empty
+ * list unless the query has `types`, `after`, and `before` together, so all
+ * three are always sent.
+ */
+export function streamElementsHistoryUrl(channelId: string, now = Date.now(), days = STREAMELEMENTS_HISTORY_DAYS, types: readonly string[] = STREAMELEMENTS_HISTORY_TYPES) {
+  const params = new URLSearchParams({ limit: '100', after: new Date(now - days * 24 * 60 * 60 * 1000).toISOString(), before: new Date(now).toISOString() })
+  for (const type of types) params.append('types', type)
+  return `${API_BASE}/activities/${encodeURIComponent(channelId)}?${params}`
+}
+
+export async function fetchRecentActivities(channel: StreamElementsChannel, options: { days?: number; types?: readonly string[]; tips?: boolean } = {}): Promise<ActivityEvent[]> {
   const headers = { Authorization: `Bearer ${channel.jwt}`, Accept: 'application/json' }
-  const after = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString()
   const urls = [
-    `${API_BASE}/activities/${encodeURIComponent(channel.channelId)}?limit=50&after=${encodeURIComponent(after)}`,
-    `${API_BASE}/activities/${encodeURIComponent(channel.channelId)}?limit=50`,
-    `${API_BASE}/tips/${encodeURIComponent(channel.channelId)}?limit=25`,
+    streamElementsHistoryUrl(channel.channelId, Date.now(), options.days, options.types),
+    ...(options.tips === false ? [] : [`${API_BASE}/tips/${encodeURIComponent(channel.channelId)}?limit=25`]),
   ]
   const events: ActivityEvent[] = []
   for (const url of urls) {

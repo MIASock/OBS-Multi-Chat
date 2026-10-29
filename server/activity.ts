@@ -16,8 +16,22 @@ export type ActivityKind = 'follow' | 'subscription' | 'gift' | 'cheer' | 'raid'
  * `custom` is one the streamer made; `other` is a built-in type this build does not know yet.
  */
 export type ActivityPowerUp = 'gigantify' | 'message-effect' | 'celebration' | 'custom' | 'other'
-/** Which wire delivered the alert. `source` is the platform the event is about. */
-export type ActivityFeed = 'native' | 'streamelements'
+/**
+ * Which wire delivered the alert. `source` is the platform the event is about.
+ * `twitch-notice` is Twitch's chat notification for a sub, resub, or gifted sub: the
+ * same spend `channel.subscribe` reports, sent on a second wire, so the two fold together.
+ */
+export type ActivityFeed = 'native' | 'streamelements' | 'twitch-notice'
+/** Twitch sub plan. `prime` is a Prime Gaming sub; the numbers are Twitch's tier codes. */
+export type ActivitySubTier = 'prime' | '1000' | '2000' | '3000'
+
+/** Normalize a Twitch or StreamElements sub plan (`Prime`, `prime`, `1000`, ...). Anything else is unknown. */
+export function normalizeSubTier(raw: unknown): ActivitySubTier | undefined {
+  const value = String(raw ?? '').trim().toLowerCase()
+  if (value === 'prime') return 'prime'
+  if (value === '1000' || value === '2000' || value === '3000') return value
+  return
+}
 
 export type ActivityEvent = {
   id: string
@@ -35,6 +49,9 @@ export type ActivityEvent = {
   source?: ActivityPlatform
   powerUp?: ActivityPowerUp
   feed?: ActivityFeed
+  tier?: ActivitySubTier
+  /** Who gifted this sub. Set only on a gifted sub's row, which is the recipient's. */
+  giftedBy?: string
 }
 
 /** Kick handles in messages are the dash-separated URL slug, not the display username. Normalize to that form. */
@@ -216,7 +233,11 @@ export function createActivityStore(filePath: string, maxEvents = ACTIVITY_MAX) 
       try { save() } catch (error) { console.error('Activity save:', error instanceof Error ? error.message : error) }
       return true
     },
-    add(incoming: ActivityEvent) {
+    /**
+     * `true` for a new row, `'updated'` when a duplicate filled in a missing sub plan or gifter, `false` when dropped.
+     * `fillOnly` never adds a row; it only fills in rows that are already stored.
+     */
+    add(incoming: ActivityEvent, options: { fillOnly?: boolean } = {}): boolean | 'updated' {
       const user = String(incoming.user || 'Anonymous').replace(/^@+/, '') || 'Anonymous'
       const source = incoming.source || incoming.platform
       const event: ActivityEvent = {
@@ -227,7 +248,26 @@ export function createActivityStore(filePath: string, maxEvents = ACTIVITY_MAX) 
         time: parseActivityTime(incoming.time),
         profileUrl: profileUrl(source, incoming.user || user, incoming.userId, incoming.handle) || incoming.profileUrl,
       }
-      if (events.some((item) => activityIsDuplicate(item, event))) return false
+      const duplicate = events.find((item) => activityIsDuplicate(item, event))
+      if (duplicate) {
+        // The first copy of a sub can lack the plan (channel.subscribe never says Prime) or
+        // the gifter. A later copy that knows them fills them in instead of being dropped.
+        let filled = false
+        if (event.tier && duplicate.tier !== event.tier && (!duplicate.tier || event.tier === 'prime')) {
+          duplicate.tier = event.tier
+          filled = true
+        }
+        if (event.giftedBy && !duplicate.giftedBy) {
+          duplicate.giftedBy = event.giftedBy
+          filled = true
+        }
+        if (!filled) return false
+        if (!isTestEvent(duplicate)) {
+          try { save() } catch (error) { console.error('Activity save:', error instanceof Error ? error.message : error) }
+        }
+        return 'updated'
+      }
+      if (options.fillOnly) return false
       const next = [event, ...events]
       const tests = next.filter(isTestEvent)
       const real = newestFirst(next.filter((item) => !isTestEvent(item))).slice(0, cap)

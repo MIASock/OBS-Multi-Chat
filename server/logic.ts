@@ -24,7 +24,7 @@ export type {
 } from './types.js'
 
 export { parseActivityMax, parseChatMax } from './logic/limits.js'
-export { activityAppendedEvent, activitySseFields, sseBroadcastEvent, sseChangedKeys, sseNamedEvent } from './logic/sse.js'
+export { activityAppendedEvent, activitySseFields, snapshotActivityEvents, sseBroadcastEvent, sseChangedKeys, sseNamedEvent } from './logic/sse.js'
 export { looksLikePlaceholder, kickBadges, kickCategorySkipped, kickChannelPatch, kickChannelPollFailure, kickEmoteUrl, kickStreamDetails, parseKickParts, shouldWarnKickChatDown } from './logic/kick.js'
 export { normalizeAvatar, shareInFlight, summarizeApiError } from './logic/http.js'
 export {
@@ -169,6 +169,7 @@ export {
   parseAlertSettings,
   parseAppSettings,
   parseAutoLiveCheck,
+  parseMentionKeywords,
 } from './logic/settings.js'
 export {
   isPermanentTokenRefreshError,
@@ -185,3 +186,5 @@ export {
   translateFailureMessage,
 } from './logic/translate.js'
 export type { TranslateProvider } from './logic/translate.js'
+export { applyThirdPartyEmotes, bttvEmotes, ffzEmotes, mergeEmoteMaps, sevenTvEmotes } from './logic/third-party-emotes.js'
+export type { EmoteMap } from './logic/third-party-emotes.js'

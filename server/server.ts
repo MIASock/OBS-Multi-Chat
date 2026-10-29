@@ -19,7 +19,7 @@ import { closeListeningServer, corsOriginDelegate, createControlGuard, lanWatchU
 import { createLogBuffer } from './log-buffer.js'
 import { createLogFile, resolveLogFilePath } from './log-file.js'
 import { createHostSession, findCompanionExe, nativeWindowPlan, serverShouldOpenWindow, windowsMessageBox } from './console-window.js'
-import { StreamElementsClient, fetchRecentActivities, hydrateStreamElements } from './streamelements.js'
+import { STREAMELEMENTS_REPAIR_DAYS, STREAMELEMENTS_REPAIR_TYPES, StreamElementsClient, fetchRecentActivities, hydrateStreamElements } from './streamelements.js'
 import { checkForUpdates, getCurrentVersion, isDesktopPackaged } from './check-update.js'
 import { installRelayObsDocks, obsProcessRunning, operatorFilesDir } from './obs-docks.js'
 import { registerHttpRoutes } from './http-routes.js'
@@ -27,9 +27,11 @@ import { createKickLive } from './kick-live.js'
 import { createOAuth } from './oauth.js'
 import { createTwitchLive } from './twitch-live.js'
 import { createYouTubeLive } from './youtube-live.js'
+import { createThirdPartyEmotes } from './third-party-emotes.js'
 import {
   YOUTUBE_QUOTA_LIMIT,
   applyChatModeration,
+  applyThirdPartyEmotes,
   defaultAppSettings,
   LIVE_STATUS_POLL_MS,
   shouldPollLiveStatus,
@@ -45,6 +47,7 @@ import {
   parseActivityMax,
   parseChatMax,
   activitySseFields,
+  snapshotActivityEvents,
   parseTranslatedText,
   pruneYouTubeSeenIds,
   resolveTranslateConfig,
@@ -179,7 +182,7 @@ if (process.argv.includes('--add-obs-docks')) {
   process.exit()
 }
 
-type State = { bootId: string; accounts: Account[]; streamInfo: StreamInfoMap; messages: ChatMessage[]; health: Record<Platform, Health>; activity: ActivityEvent[]; activityWarnings: string[]; chatWarnings: string[]; youtubePrivacy: YoutubePrivacyNotice[]; streamelements: StreamElementsStatus; activityFallback: boolean; ignoreMissingJwt: boolean; dropOldAlerts: boolean; translateChat: boolean; translateError: string; alerts: AlertSettings; activityMax: number; autoLiveCheck: AppSettings['autoLiveCheck']; youtubeQuota: YoutubeQuotaStatus }
+type State = { bootId: string; accounts: Account[]; streamInfo: StreamInfoMap; messages: ChatMessage[]; health: Record<Platform, Health>; activity: ActivityEvent[]; activityWarnings: string[]; chatWarnings: string[]; youtubePrivacy: YoutubePrivacyNotice[]; streamelements: StreamElementsStatus; activityFallback: boolean; ignoreMissingJwt: boolean; dropOldAlerts: boolean; translateChat: boolean; translateError: string; mentionKeywords: string[]; alerts: AlertSettings; activityMax: number; autoLiveCheck: AppSettings['autoLiveCheck']; youtubeQuota: YoutubeQuotaStatus }
 
 const port = Number(process.env.PORT || 4173)
 const { lanEnabled: envLanEnabled } = resolveBindHost()
@@ -267,6 +270,7 @@ const state: State = {
   dropOldAlerts: settings.dropOldAlerts,
   translateChat: settings.translateChat,
   translateError: '',
+  mentionKeywords: [...settings.mentionKeywords],
   alerts: { ...settings.alerts, disabled: [...settings.alerts.disabled] },
   activityMax,
   autoLiveCheck: { ...settings.autoLiveCheck },
@@ -470,10 +474,11 @@ async function drainTranslations() {
   translating = false
 }
 
-function addActivity(event: ActivityEvent) {
-  if (!activityStore.add(event)) return
+function addActivity(event: ActivityEvent, options?: { fillOnly?: boolean }) {
+  const added = activityStore.add(event, options)
+  if (!added) return
   state.activity = activityStore.list()
-  console.log(activityLogLine(event))
+  if (added === true) console.log(activityLogLine(event))
   broadcast()
 }
 
@@ -482,8 +487,8 @@ function addNativeActivity(event: ActivityEvent, options: { always?: boolean } =
   addActivity({ ...event, feed: event.feed || 'native' })
 }
 
-function addStreamElementsActivity(event: ActivityEvent) {
-  addActivity({ ...event, feed: event.feed || 'streamelements' })
+function addStreamElementsActivity(event: ActivityEvent, options?: { fillOnly?: boolean }) {
+  addActivity({ ...event, feed: event.feed || 'streamelements' }, options)
 }
 
 async function streamElementsChannelFor(provider: string, anyChannel = false) {
@@ -593,12 +598,32 @@ async function startStreamElements(backfill = false) {
     for (const channel of channels) {
       const events = await fetchRecentActivities(channel)
       for (const event of events) addStreamElementsActivity(event)
+      // Older sub and gift rows only get a missing gifter or plan filled in. Nothing is re-added.
+      const older = await fetchRecentActivities(channel, { days: STREAMELEMENTS_REPAIR_DAYS, types: STREAMELEMENTS_REPAIR_TYPES, tips: false })
+      for (const event of older) addStreamElementsActivity(event, { fillOnly: true })
     }
   }
   return failed
 }
 
-function addMessage(message: ChatMessage, options?: { preload?: boolean; ingest?: 'official' | 'innertube'; source?: string }) {
+const thirdPartyEmotes = createThirdPartyEmotes()
+
+function emoteChannelId(platform: Platform) {
+  return platform === 'YouTube' ? tokens.YouTube?.channelId : tokens[platform]?.userId
+}
+
+/** 7TV / BTTV / FFZ words become emotes. Not on the optimistic send row: its platform echoes carry the native emotes and merge into it. */
+function withThirdPartyEmotes(message: ChatMessage, source?: string) {
+  if (source === 'send') return message
+  const emotes = thirdPartyEmotes.emotesFor(message.platform, emoteChannelId(message.platform))
+  if (!emotes.size) return message
+  const parts = message.parts?.length ? message.parts : [{ type: 'text' as const, text: message.text }]
+  const next = applyThirdPartyEmotes(parts, emotes)
+  return next === parts ? message : { ...message, parts: next }
+}
+
+function addMessage(incoming: ChatMessage, options?: { preload?: boolean; ingest?: 'official' | 'innertube'; source?: string }) {
+  const message = withThirdPartyEmotes(incoming, options?.source)
   const result = mergeIncomingChat(state.messages, message, options, {
     ownHandles: ownHandles(),
     ownUserIds: ownUserIds(),
@@ -650,6 +675,7 @@ function sseSettings() {
     dropOldAlerts: state.dropOldAlerts,
     translateChat: state.translateChat,
     translateError: state.translateError,
+    mentionKeywords: state.mentionKeywords,
     alerts: state.alerts,
     activityMax: state.activityMax,
     autoLiveCheck: state.autoLiveCheck,
@@ -664,7 +690,7 @@ function pushSse(chunk: string) {
 function broadcast() {
   state.activity = activityStore.list()
   const activityFields = activitySseFields(lastActivityEvents, state.activity, state.activityWarnings)
-  lastActivityEvents = state.activity
+  lastActivityEvents = snapshotActivityEvents(state.activity)
   const next = {
     chat: JSON.stringify(state.messages),
     activity: JSON.stringify({ activity: state.activity, activityWarnings: state.activityWarnings }),
@@ -760,6 +786,7 @@ kick = createKickLive({
 })
 
 function startAdapter(platform: Platform) {
+  void thirdPartyEmotes.ready(platform, emoteChannelId(platform))
   if (platform === 'Twitch') {
     twitch.twitchEventSubUnsupported = false
     twitch.twitchBadgesLoaded = false
